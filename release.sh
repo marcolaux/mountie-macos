@@ -22,7 +22,12 @@ trap 'rm -rf "$TMP"' EXIT
 
 ./build.sh release
 codesign --verify --strict "$APP"
-ditto -c -k --keepParent "$APP" "$ZIP"
+# Tahoe stamps com.apple.provenance xattrs on everything; ditto -c -k would store
+# them as AppleDouble ._ files inside the bundle — unsealed contents in embedded
+# frameworks' roots, which newer Gatekeeper rejects after Archive Utility extracts
+# them as literal files. Strip them and sequester any rest into __MACOSX/.
+xattr -cr "$APP"
+ditto -c -k --keepParent --sequesterRsrc "$APP" "$ZIP"
 echo "Packaged $PWD/$ZIP"
 
 # The website's download card names the asset and version this release
@@ -41,7 +46,7 @@ if xcrun notarytool history --keychain-profile "$PROFILE" >/dev/null 2>&1; then
   # The staple changed the app bundle, so the zip must be rebuilt to carry the
   # ticket — otherwise the published download has none and every first launch
   # would depend on Gatekeeper's online check.
-  ditto -c -k --keepParent "$APP" "$ZIP"
+  ditto -c -k --keepParent --sequesterRsrc "$APP" "$ZIP"
   spctl --assess --type execute --verbose "$APP"
 else
   echo "No notarytool profile '$PROFILE' — publishing without notarization"
@@ -53,7 +58,7 @@ if [[ -n $(git status --porcelain) ]]; then
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 fi
-git push
+git push --set-upstream origin main
 
 # The feed Sparkle downloads — one item is enough, the newest wins. Attaching it
 # to the release is what makes the app's stable feed URL resolve:
