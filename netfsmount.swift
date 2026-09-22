@@ -42,16 +42,21 @@ if rc == 0 {
 
 // Every message carries the code: EAUTH is the only one that means user name or password
 // (NetFS returns it for a 401 as well as for a missing password). EACCES/EPERM come from
-// the server refusing this user, or from macOS refusing the mount itself — a privacy
-// block on the shares folder, say — and are not worth a sign-in dialog.
+// the server refusing this user, or from macOS refusing the mount itself (a privacy block),
+// and are not worth a sign-in dialog.
 switch rc {
 case EAUTH:
     fail(quiet
          ? "Sign-in required. Mount it once from the app so macOS can save the password to your Keychain."
          : "Authentication failed (error \(rc)).")
-case EACCES, EPERM:
-    fail("Access denied (error \(rc): \(String(cString: strerror(rc)))). Either the server refused this user, "
-         + "or macOS didn't allow the mount; check that Mountie may use the shares folder.")
+case EPERM:
+    // What macOS returns when Mountie lacks Network Volumes access (Files & Folders), which
+    // the mount needs; the prompt for it doesn't always appear (managed Macs suppress it).
+    fail("macOS didn't allow the mount (error \(rc): \(String(cString: strerror(rc)))). In System Settings → "
+         + "Privacy & Security, allow Mountie under Files & Folders → Network Volumes, or give it Full Disk Access.")
+case EACCES:
+    fail("Access denied (error \(rc): \(String(cString: strerror(rc)))). The server refused this user, "
+         + "or macOS didn't allow the mount; check Mountie's access to Network Volumes in System Settings.")
 case EEXIST:
     fail("This share is already mounted somewhere else (for example from Finder). Unmount it there first.")
 case ECANCELED, -128:
