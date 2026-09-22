@@ -1669,6 +1669,13 @@ struct MenuContent: View {
                                      set: { _ in Task { await store.toggle(share) } }))
                     .disabled(working)
             }
+            // Opens a share's mount folder; like Manage Shares' folder button, only once mounted.
+            Menu("Show in Finder") {
+                ForEach(store.shares) { share in
+                    Button(share.name) { Task { await store.reveal(share) } }
+                        .disabled(!share.mounted)
+                }
+            }
         }
         Divider()
         Button("Manage Shares…") { WindowManager.shared.showManage() }
