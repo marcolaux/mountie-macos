@@ -1,0 +1,10 @@
+{
+  "domain": "mountie.miniml.net",
+  "releasesRepo": "marcolaux/mountie-macos",
+  "sourceRepo": "marcolaux/mountie-macos",
+  "pagesBranch": "gh-pages",
+  "version": "1.2.1",
+  "assets": {
+    "mac": "Mountie-1.2.1.zip"
+  }
+}

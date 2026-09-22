@@ -1,0 +1,303 @@
+#!/bin/zsh
+# mountiectl — mount/unmount NFS, SMB, WebDAV and S3 shares listed in ~/Library/Application Support/Mountie/shares.conf
+# Mounts into <shares folder>/<name> (default ~/Mountie; set MOUNTIE_BASE to change it),
+# a folder owned by the user, so no sudo is needed.
+#
+# S3: macOS has no S3 file system, so the bundled rclone (next to this script) serves the
+# bucket as NFS on 127.0.0.1 and the share is mounted from there, like a local NFS share.
+# The S3 keys come from Mountie's Keychain via RCLONE_CONFIG_* env vars (set by the app),
+# so rclone needs no config file — and can't work standalone for S3.
+#
+# Usage: mountiectl list | mount NAME [quiet] | unmount NAME [force] | toggle NAME | reveal NAME
+#        mountiectl probe NAME   (exit 0 if the server is reachable)
+#        mountiectl ready NAME   (exit 0 if the server will mount now — checks without mounting)
+#        mountiectl tailscale    (exit 0 if Tailscale is connected; prints the active
+#                                 tailnet when the CLI can tell)
+#        mountiectl tailscale-accounts   (prints the configured profiles as JSON)
+#        mountiectl config
+
+CONF="${MOUNTIE_CONF:-$HOME/Library/Application Support/Mountie/shares.conf}"
+BASE="${MOUNTIE_BASE:-$HOME/Mountie}"; BASE=${BASE/#\~/$HOME}; BASE=${BASE%/}   # shares folder
+NETFS="${MOUNTIE_NETFS:-${0:A:h}/netfsmount}"   # SMB / WebDAV helper (uses macOS's NetFS, like Finder)
+STATEDIR="${MOUNTIE_STATE:-$HOME/Library/Application Support/Mountie/state}"
+RCLONE="${MOUNTIE_RCLONE:-${0:A:h}/rclone}"    # S3 helper (bundled; falls back to PATH for dev)
+[[ -x $RCLONE ]] || RCLONE=$(whence -p rclone 2>/dev/null)
+SHOWMOUNT=/usr/bin/showmount; [[ -x $SHOWMOUNT ]] || SHOWMOUNT=/usr/sbin/showmount
+DEFAULT_OPTS="soft"
+
+die() { print -u2 -- "$*"; exit 1 }
+
+write_sample_conf() {
+  mkdir -p "${CONF:h}"
+  cat > "$CONF" <<'EOF'
+# Shares, one per line:   name   address   [NFS mount options]
+#
+# The name becomes a subfolder of the shares folder (default ~/Mountie; no spaces). Addresses:
+#
+#   media   nfs://nas.example.com/volume1/media        ro,soft     NFS (options optional, default: soft)
+#   files   smb://alex@nas.example.com/Documents                  SMB
+#   cloud   https://dav.example.com/remote.php/dav           WebDAV
+#   photos  s3://s3.us-east-1.amazonaws.com/bucket            S3 (keys live in Mountie's Keychain)
+#
+# Spaces in an address must be written as %20. Passwords are never stored here:
+# SMB and WebDAV ask macOS, which can save them to your Keychain.
+#
+# Note: NFS "soft" returns errors if the server goes away instead of freezing apps
+# ("hard"), but can lose writes in that case. Use "hard" for critical data.
+EOF
+}
+
+# Prints "name<TAB>address<TAB>options" for each configured share.
+shares() {
+  [[ -f $CONF ]] || write_sample_conf
+  local name spec opts
+  while read -r name spec opts; do
+    [[ -z $name || $name == \#* ]] && continue
+    [[ $spec != *://* ]] && { print -u2 "Skipping invalid line for '$name' in $CONF"; continue }
+    printf '%s\t%s\t%s\n' "$name" "$spec" "${opts:-$DEFAULT_OPTS}"
+  done < "$CONF"
+}
+
+# Decodes %XX escapes.
+urldecode() { printf '%b' "${1//\%/\\x}" }
+
+# Sets PROTO (nfs|smb|webdav|s3), HOST, PORT, NFS_SPEC (host:/path, what mount_nfs wants)
+# and BUCKET (the rclone remote path for S3) from $SPEC.
+parse_spec() {
+  local scheme=${SPEC%%://*} rest=${SPEC#*://} auth
+  auth=${rest%%/*}; auth=${auth##*@}            # host[:port], user part dropped
+  HOST=${auth%%:*}; PORT=${auth#$HOST}; PORT=${PORT#:}
+  case ${scheme:l} in
+    smb)   PROTO=smb;    PORT=${PORT:-445} ;;
+    http)  PROTO=webdav; PORT=${PORT:-80} ;;
+    https) PROTO=webdav; PORT=${PORT:-443} ;;
+    nfs)   PROTO=nfs;    PORT=${PORT:-2049}
+           [[ $rest == */* ]] || die "NFS address '$SPEC' needs an export path"
+           NFS_SPEC="$HOST:$(urldecode "/${rest#*/}")" ;;
+    s3)    PROTO=s3;     PORT=${PORT:-443}
+           [[ -n $HOST && $rest == */* ]] || die "S3 address '$SPEC' needs a host and a bucket"
+           BUCKET=$(urldecode "${rest#*/}")
+           [[ -n $BUCKET ]] || die "S3 address '$SPEC' needs a bucket" ;;
+    *)     die "Unsupported address '$SPEC' (use nfs://, smb://, http://, https:// or s3://)" ;;
+  esac
+}
+
+lookup() {  # sets NAME SPEC OPTS MP and the parse_spec variables for share $1
+  NAME=$1
+  local line
+  line=$(shares | awk -F'\t' -v n="$NAME" '$1==n {print; exit}')
+  [[ -n $line ]] || die "No share named '$NAME' in $CONF"
+  local -a f; f=("${(@ps:\t:)line}")
+  SPEC=$f[2]; OPTS=$f[3]
+  MP="$BASE/$NAME"
+  parse_spec
+}
+
+# Anything mounted at the share's folder counts, whatever the file system (nfs, smbfs, webdav).
+is_mounted() { /sbin/mount | grep -qF " on $MP ("; }
+
+# Is the share's server reachable on its protocol's port? (needs HOST and PORT)
+reachable() { /usr/bin/nc -z -G 3 "$HOST" "$PORT" >/dev/null 2>&1 }
+
+# Runs a command with a seconds cap, so a wedged server can't stall the watcher:
+# an RPC call that never gets answered must not hang the probe schedule.
+timed() {
+  local secs=$1; shift
+  "$@" & local cmd=$!
+  ( sleep "$secs"; kill "$cmd" 2>/dev/null ) & local guard=$!
+  wait "$cmd"; local rc=$?
+  kill "$guard" 2>/dev/null
+  return $rc
+}
+
+# Will the share mount right now — checked without mounting anything? Reachable
+# only says the port answers, which a restarting server does long before it can
+# mount again; mounting then just produces I/O errors. What says "ready" depends
+# on the protocol (see the cases below). No state is touched either way.
+ready() {
+  case $PROTO in
+    s3)  s3_probe ;;    # listing the bucket also checks the keys, which is what auto-mount needs
+    smb) reachable ;;    # port 445 accepting means the server is serving sessions
+    nfs) nfs_ready ;;
+    *)   webdav_ready ;;
+  esac
+}
+
+# mount_nfs (v3) gets the export from mountd — the same daemon showmount asks,
+# and showmount mounts nothing. -3 pins the mount protocol version mount_nfs
+# negotiates by default. vers=4 shares skip mountd entirely (they mount straight
+# off port 2049), so for them the port check already says everything.
+nfs_ready() {
+  local o
+  for o in ${(s:,:)OPTS}; do
+    [[ $o == (vers|nfsvers)=4* ]] && { reachable; return }
+  done
+  timed 5 "$SHOWMOUNT" -3 -e "$HOST" >/dev/null 2>&1
+}
+
+# Any HTTP response — even a 401 — means the server is serving; a connection
+# error or timeout means it isn't.
+webdav_ready() { /usr/bin/curl -s -o /dev/null -m 5 "$SPEC" }
+
+# Tailscale state. Sets TS_UP (1/0) and TAILNET (the active tailnet, "" if unknown).
+# Prefer the CLI's own answer; if it can't give one (not installed, app not running),
+# fall back to looking for a tunnel interface holding a Tailscale address (100.64.0.0/10) —
+# which can't say which account is active, so TAILNET stays empty.
+tailscale_state() {
+  local cli out
+  for cli in /Applications/Tailscale.app/Contents/MacOS/Tailscale /opt/homebrew/bin/tailscale /usr/local/bin/tailscale; do
+    [[ -x $cli ]] || continue
+    out=$("$cli" status --json 2>/dev/null)
+    [[ $out =~ '"BackendState": *"([A-Za-z]+)"' ]] || continue
+    if [[ ${match[1]} == Running ]]; then
+      TS_UP=1
+      # [^}]* crosses the newline inside the pretty-printed "CurrentTailnet": { ... } block
+      [[ $out =~ '"CurrentTailnet": *\{[^}]*"Name": *"([^"]+)"' ]] && TAILNET=${match[1]}
+    fi
+    return   # the CLI answered: that's the verdict
+  done
+  /sbin/ifconfig 2>/dev/null | grep -Eq 'inet 100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' && TS_UP=1
+}
+
+# The profiles (accounts) set up on this Mac, as the CLI's JSON, passed through verbatim
+# (zsh doesn't parse JSON; Mountie decodes it). Fails when no CLI can list — older
+# versions without `switch --list` degrade to "any account".
+tailscale_accounts() {
+  local cli out
+  for cli in /Applications/Tailscale.app/Contents/MacOS/Tailscale /opt/homebrew/bin/tailscale /usr/local/bin/tailscale; do
+    [[ -x $cli ]] || continue
+    out=$("$cli" switch --list --json 2>/dev/null) || continue
+    [[ $out == "["* ]] && { print -r -- "$out"; return 0 }
+  done
+  return 1
+}
+
+# --- S3 plumbing -----------------------------------------------------------
+# rclone (started detached, it outlives the app) serves the bucket as NFS on 127.0.0.1,
+# the share is mounted from there, and the process is killed on unmount. The PID lives in
+# $STATEDIR/<name>.pid. Keys come via RCLONE_CONFIG_* env vars (set by Mountie).
+
+s3_keys_missing() { [[ -z ${RCLONE_CONFIG_MOUNTIE_ACCESS_KEY_ID:-} ]] }
+
+# Asks the S3 server (through rclone) whether the bucket is there and the keys work.
+# Unlike the TCP probe this also validates credentials, which is what auto-mount wants.
+s3_probe() {
+  [[ -n $RCLONE && -x $RCLONE ]] || return 1
+  "$RCLONE" lsd "mountie:$BUCKET" --max-depth 1 -1 --contimeout 5s >/dev/null 2>&1
+}
+
+# Starts rclone for this share, waits for it to listen, then NFS-mounts it.
+s3_mount() {
+  [[ -n $RCLONE && -x $RCLONE ]] || die "rclone not found (bundled next to this script, or on PATH)"
+  s3_keys_missing && die "S3 keys missing: set them up in Mountie (they live in its Keychain)"
+  stop_rclone                                   # a leftover from an earlier mount, if any
+  mkdir -p "$MP" "$STATEDIR" || die "Can't create $MP"
+
+  local port try
+  for try in 0 1 2 3 4 5 6 7; do
+    port=$((26123 + try))
+    nc -z -G 1 127.0.0.1 $port >/dev/null 2>&1 || break
+  done
+  nc -z -G 1 127.0.0.1 $port >/dev/null 2>&1 && die "No free local port for rclone"
+
+  nohup "$RCLONE" serve nfs "mountie:$BUCKET" --addr "127.0.0.1:$port" \
+        --vfs-cache-mode full --log-level INFO --log-file "$STATEDIR/$NAME.log" >/dev/null 2>&1 &!
+  local pid=$!
+  print -r -- "$pid $port" > "$STATEDIR/$NAME.pid"
+
+  # Wait for rclone to listen (and notice if it dies, e.g. bad keys).
+  local i
+  for i in {1..50}; do
+    nc -z -G 1 127.0.0.1 $port >/dev/null 2>&1 && break
+    kill -0 $pid 2>/dev/null || { rm -f "$STATEDIR/$NAME.pid"
+                                   rmdir "$MP" 2>/dev/null
+                                   die "rclone failed to start: $(tail -n 2 "$STATEDIR/$NAME.log" 2>/dev/null)" }
+    sleep 0.2
+  done
+  nc -z -G 1 127.0.0.1 $port >/dev/null 2>&1 || { kill $pid 2>/dev/null; rm -f "$STATEDIR/$NAME.pid"
+                                                   rmdir "$MP" 2>/dev/null; die "rclone didn't start listening" }
+
+  local err
+  err=$(/sbin/mount_nfs -o "port=$port,mountport=$port,tcp,soft,nobrowse" "127.0.0.1:/" "$MP" 2>&1) || {
+    kill $pid 2>/dev/null
+    rm -f "$STATEDIR/$NAME.pid"
+    rmdir "$MP" 2>/dev/null
+    die "Mount failed: ${err:-unknown error}"
+  }
+  print "Mounted $NAME at $MP"
+}
+
+# Stops this share's rclone, if it's still running (checked to never kill a recycled PID).
+stop_rclone() {
+  local f="$STATEDIR/$NAME.pid" pid i
+  [[ -f $f ]] || return 0
+  pid=$(cut -d' ' -f1 "$f")
+  rm -f "$f"
+  [[ $pid == <-> ]] || return 0
+  if kill -0 $pid 2>/dev/null && [[ $(ps -p $pid -o comm= 2>/dev/null) == *rclone* ]]; then
+    kill $pid 2>/dev/null
+    for i in {1..20}; do kill -0 $pid 2>/dev/null || return 0; sleep 0.1; done
+    kill -9 $pid 2>/dev/null
+  fi
+}
+
+# ---------------------------------------------------------------------------
+
+do_mount() {  # do_mount NAME [quiet]   (quiet: never show a sign-in dialog; used for automatic mounts)
+  lookup "$1"
+  local quiet=${2:-}
+  is_mounted && { print "$NAME is already mounted at $MP"; return 0 }
+  case $PROTO in
+    s3) ;;
+    *)  reachable || die "Can't reach $HOST on port $PORT. Are you on the right network/VPN?" ;;
+  esac
+  mkdir -p "$MP" || die "Can't create $MP"
+  local err
+  case $PROTO in
+    # nobrowse: keep the volume out of Finder's Locations (the app shows the share in the
+    # sidebar itself, named after the share — the server-derived volume name would show twice).
+    nfs) err=$(/sbin/mount_nfs -o "$OPTS,nobrowse" "$NFS_SPEC" "$MP" 2>&1) ;;
+    s3)  s3_mount; return 0 ;;
+    *)   [[ -x $NETFS ]] || { rmdir "$MP" 2>/dev/null; die "SMB/WebDAV helper not found at $NETFS" }
+         err=$("$NETFS" "$SPEC" "$MP" ${quiet:+--quiet} 2>&1) ;;
+  esac || {
+    rmdir "$MP" 2>/dev/null
+    die "Mount failed: ${err:-unknown error}"
+  }
+  print "Mounted $NAME at $MP"
+}
+
+do_unmount() {  # do_unmount NAME [force]  (force is for servers that went away)
+  lookup "$1"
+  is_mounted || { stop_rclone; print "$NAME is not mounted"; return 0 }
+  local err force=${2:-}
+  err=$(/sbin/umount ${force:+-f} "$MP" 2>&1) || err=$(/usr/sbin/diskutil unmount ${force:+force} "$MP" 2>&1) \
+    || die "Unmount failed (is a file in use?): $err"
+  rmdir "$MP" 2>/dev/null
+  stop_rclone
+  print "Unmounted $NAME"
+}
+
+case ${1:-} in
+  list)
+    shares | while IFS=$'\t' read -r n s o; do
+      NAME=$n MP="$BASE/$n"
+      is_mounted && st=mounted || st=unmounted
+      printf '%s\t%s\t%s\n' "$n" "$st" "$s"
+    done ;;
+  mount)   do_mount "${2:?share name required}" "${3:-}" ;;
+  unmount) do_unmount "${2:?share name required}" "${3:-}" ;;
+  probe)   lookup "${2:?share name required}"
+           case $PROTO in s3) s3_probe ;; *) reachable ;; esac ;;
+  ready)   lookup "${2:?share name required}"; ready ;;
+  tailscale) TS_UP=0 TAILNET=""
+             tailscale_state
+             [[ -n $TAILNET ]] && print -r -- "$TAILNET"   # active account, when known
+             (( TS_UP )) ;;                                  # exit code: running or not
+  tailscale-accounts) tailscale_accounts ;;
+  toggle)  lookup "${2:?share name required}"
+           if is_mounted; then do_unmount "$NAME"; else do_mount "$NAME"; fi ;;
+  reveal)  lookup "${2:?share name required}"; /usr/bin/open "$MP" ;;
+  config)  [[ -f $CONF ]] || write_sample_conf; print -r -- "$CONF" ;;
+  *) die "Usage: mountiectl list | mount NAME [quiet] | unmount NAME [force] | toggle NAME | reveal NAME | probe NAME | ready NAME | tailscale | tailscale-accounts | config" ;;
+esac

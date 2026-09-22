@@ -1,0 +1,27 @@
+{
+  "name": "mountie-website",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Mountie — the website. A static single page, built with Vite + Vue, published to GitHub Pages from this repo's gh-pages branch.",
+  "author": "Marco Laux <hi@marcolaux.com> (https://miniml.net)",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit -p tsconfig.json && vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.json",
+    "icons": "./scripts/icons.sh",
+    "publish": "node scripts/publish.mjs"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^26.6.2",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vite": "^8.2.0",
+    "vue": "^3.5.40",
+    "vue-i18n": "^11.4.8",
+    "vue-tsc": "^3.3.9"
+  }
+}

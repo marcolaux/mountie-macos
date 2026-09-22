@@ -1,0 +1,90 @@
+/*
+ * The site's tokens — a two-scheme ladder.
+ *
+ * SOURCE: copied from hypha's website (`hypha/apps/website/src/styles/tokens.css`),
+ * whose ladder descends from that app's theme system. The rule, from hypha's
+ * DESIGN.md: the surface being written on has the most contrast under the
+ * words, and everything not in use recedes toward the chrome. On the site the
+ * "paper" is a screenshot's window and the hero's product frame; the page
+ * itself is the ground.
+ *
+ * `--ground` is the page's own floor and sits one step BELOW `--background`,
+ * so the product frame reads as a lit object on the page rather than a hole
+ * in it (Linear's page is #08090a under a frame at #0f1011 for the same
+ * reason). In light the two coincide: white on white, and the frame's ring
+ * and shadow do the separating.
+ */
+:root {
+  color-scheme: dark light;
+
+  /* The base pair, dark. */
+  --background: #0f1115;
+  --ground: #090a0d;
+  --paragraph: #c7cad1;
+  --heading: #f1f2f5;
+  --muted: #8b8f9b;
+  --accent: #7c5cfc;
+  --accent-foreground: #ffffff;
+
+  /* The ladder. */
+  --paper: color-mix(in oklab, var(--background) 92%, black);
+  --card: color-mix(in oklab, var(--paper) 93%, var(--paragraph));
+  --nested: color-mix(in oklab, var(--card) 96%, var(--paragraph));
+  --overlay: color-mix(in oklab, var(--background) 93%, var(--paragraph));
+
+  --hairline: color-mix(in oklab, var(--paragraph) 6%, transparent);
+  --hairline-strong: color-mix(in oklab, var(--paragraph) 12%, transparent);
+
+  --well-ring: 0 0 0 2px color-mix(in oklab, black 20%, transparent);
+  --glow: color-mix(in oklab, var(--paragraph) 4%, transparent);
+
+  --fill-hover: color-mix(in oklab, var(--paragraph) 3%, transparent);
+  --fill-active: color-mix(in oklab, var(--paragraph) 6%, transparent);
+  --chip-active: color-mix(in oklab, var(--paragraph) 8%, transparent);
+  --tab-active: color-mix(in oklab, var(--paragraph) 12%, transparent);
+  --row-active: color-mix(in oklab, var(--paragraph) 11%, transparent);
+  --row-edge: color-mix(in oklab, var(--accent) 45%, transparent);
+  --btn-fill: color-mix(in oklab, var(--paragraph) 2%, transparent);
+  --btn-ring: inset 0 0 0 1px color-mix(in oklab, var(--paragraph) 5%, transparent);
+
+  --radius-overlay: 12px;
+  --radius-card: 10px;
+  --shadow-overlay: 0 2px 32px color-mix(in oklab, black 25%, transparent);
+
+  /* The hero's frame sits in a pool of light, the one place the site draws a
+     gradient. Linear does the same under its demo; ours takes the text colour
+     at a whisper so it works on both grounds. */
+  --pool: radial-gradient(
+    55% 45% at 50% 100%,
+    color-mix(in oklab, var(--paragraph) 10%, transparent),
+    transparent 70%
+  );
+
+  --font-sans:
+    "Inter", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+/* Light: the ladder inverts. The paper lifts toward WHITE, the ring and
+   shadow drop to a low alpha, the glow becomes white. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-scheme="dark"]) {
+    --background: #ffffff;
+    --ground: #ffffff;
+    --paragraph: #3a3d46;
+    --heading: #14161b;
+    --muted: #6b6f7b;
+    --accent: #6d4aff;
+
+    --paper: color-mix(in oklab, var(--background) 92%, white);
+    --overlay: color-mix(in oklab, var(--background) 96%, white);
+    --well-ring: 0 0 0 2px color-mix(in oklab, black 6%, transparent);
+    --glow: color-mix(in oklab, white 35%, transparent);
+    --shadow-overlay: 0 2px 32px color-mix(in oklab, black 12%, transparent);
+    --pool: radial-gradient(
+      55% 45% at 50% 100%,
+      color-mix(in oklab, var(--accent) 10%, transparent),
+      transparent 70%
+    );
+  }
+}

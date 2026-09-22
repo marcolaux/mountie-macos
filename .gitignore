@@ -1,0 +1,10 @@
+.DS_Store
+Mountie.app/
+deps/
+Mountie-*.zip
+build.log
+.build/
+website/node_modules/
+website/dist/
+.claude/
+.env
