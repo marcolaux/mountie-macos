@@ -264,6 +264,100 @@ enum Sidebar {
     }
 }
 
+// MARK: - Mount preflight
+
+/// macOS asks for Local Network access and for protected folders (Documents, Desktop, iCloud
+/// Drive, other volumes) only when the app itself does the access. When the bundled helpers
+/// do it, the answer can be a silent "Operation not permitted" instead of a prompt. So before
+/// every mount the app touches the server and the mount folder itself, which makes macOS ask
+/// Mountie — and turns a refusal into a message saying where to allow it.
+enum Preflight {
+    /// Why this share can't be mounted right now, or nil to go ahead.
+    static func problem(for share: Share) async -> String? {
+        if let p = folderProblem(for: share) { return p }
+        return await networkProblem(for: share)
+    }
+
+    /// Creates the share's mount folder (mountiectl would too) and lists the shares folder.
+    static func folderProblem(for share: Share) -> String? {
+        let base = URL(fileURLWithPath: Prefs.mountBasePath)
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(at: base.appendingPathComponent(share.name), withIntermediateDirectories: true)
+            _ = try fm.contentsOfDirectory(atPath: base.path)
+            return nil
+        } catch {
+            let shown = (base.path as NSString).abbreviatingWithTildeInPath
+            return "macOS isn't letting Mountie use the shares folder \(shown). Allow Mountie in System Settings "
+                + "→ Privacy & Security → Files & Folders (or Full Disk Access), or choose another shares folder "
+                + "in Mountie's settings. (\(error.localizedDescription))"
+        }
+    }
+
+    /// Connects to the server's port from the app. For a server on the local network this is
+    /// what brings up macOS's Local Network prompt; while it's showing, this waits for the answer.
+    /// Anything other than a Local Network refusal is left to mountiectl to report.
+    static func networkProblem(for share: Share) async -> String? {
+        guard let (host, port) = endpoint(of: share), let nwPort = NWEndpoint.Port(rawValue: port) else { return nil }
+        let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
+        // Only touched on `queue` (every handler below runs there), hence @unchecked.
+        final class Probe: @unchecked Sendable {
+            var done = false, waitingOnPrompt = false
+            let cont: CheckedContinuation<Bool, Never>, conn: NWConnection
+            init(_ cont: CheckedContinuation<Bool, Never>, _ conn: NWConnection) { self.cont = cont; self.conn = conn }
+            func finish(_ denied: Bool) {
+                guard !done else { return }
+                done = true
+                conn.cancel()
+                cont.resume(returning: denied)
+            }
+        }
+        let denied: Bool = await withCheckedContinuation { cont in
+            let queue = DispatchQueue(label: "wtf.laux.mountie.preflight")
+            let probe = Probe(cont, conn)
+            conn.stateUpdateHandler = { state in
+                switch state {
+                case .ready, .failed, .cancelled: probe.finish(false)
+                case .waiting:
+                    if probe.conn.currentPath?.unsatisfiedReason == .localNetworkDenied {
+                        probe.waitingOnPrompt = true   // prompt showing, or access denied: keep waiting a while
+                    } else {
+                        probe.finish(false)            // refused/unreachable: mountiectl says so in its own words
+                    }
+                default: break
+                }
+            }
+            conn.start(queue: queue)
+            // A plain connection settles within seconds; one blocked by Local Network gets time
+            // for the user to answer the prompt, then counts as denied.
+            queue.asyncAfter(deadline: .now() + 5) { if !probe.waitingOnPrompt { probe.finish(false) } }
+            queue.asyncAfter(deadline: .now() + 60) { probe.finish(probe.waitingOnPrompt) }
+        }
+        guard denied else { return nil }
+        return "macOS isn't letting Mountie reach \(host) on your local network. Allow Mountie in System Settings "
+            + "→ Privacy & Security → Local Network, then mount again."
+    }
+
+    /// Host and port the share's mount connects to (same defaults as mountiectl), nil for Amazon S3.
+    static func endpoint(of share: Share) -> (String, UInt16)? {
+        var host = share.server, port: UInt16?
+        if host.hasPrefix("["), let close = host.firstIndex(of: "]") {             // [IPv6]:port
+            port = UInt16(host[host.index(after: close)...].dropFirst())
+            host = String(host[host.index(after: host.startIndex)..<close])
+        } else if host.filter({ $0 == ":" }).count == 1, let colon = host.lastIndex(of: ":") {
+            port = UInt16(host[host.index(after: colon)...])
+            host = String(host[..<colon])
+        }
+        guard !host.isEmpty else { return nil }
+        switch share.proto {
+        case .nfs: return (host, port ?? 2049)
+        case .smb: return (host, port ?? 445)
+        case .webdav: return (host, port ?? (share.https ? 443 : 80))
+        case .s3: return (host, port ?? 443)
+        }
+    }
+}
+
 // MARK: - Store
 
 /// Per-share bookkeeping for the availability watcher.
@@ -371,6 +465,10 @@ final class Store: ObservableObject {
         defer { busy.remove(share.name) }
         // S3 goes through rclone, which gets its credentials from the environment.
         let s3 = share.proto == .s3 ? S3Keys.env(for: share.name) : nil
+        if !share.mounted, let problem = await Preflight.problem(for: share) {
+            showError(problem)
+            return
+        }
         let r = await Ctl.run([share.mounted ? "unmount" : "mount", share.name], extraEnv: s3)
         if !r.ok {
             await reload()
@@ -557,6 +655,13 @@ final class Store: ObservableObject {
                     return
                 }
                 busy.insert(name)
+                if let problem = await Preflight.problem(for: cur) {
+                    busy.remove(name)
+                    st.attempts += 1
+                    autoStatus[name] = "Auto-mount failed: " + problem
+                    st.wantMounted = st.attempts < 5 || (st.attempts - 5) % 10 == 0
+                    return
+                }
                 // "quiet": never pop a sign-in dialog for an automatic mount.
                 let r = await Ctl.run(["mount", name, "quiet"], extraEnv: s3)
                 busy.remove(name)

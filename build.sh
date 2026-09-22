@@ -104,6 +104,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>NSLocationUsageDescription</key><string>Mountie reads the name of the Wi-Fi network you're on, so it can mount shares only on the networks you choose.</string>
   <key>NSLocationWhenInUseUsageDescription</key><string>Mountie reads the name of the Wi-Fi network you're on, so it can mount shares only on the networks you choose.</string>
   <key>NSLocationAlwaysAndWhenInUseUsageDescription</key><string>Mountie reads the name of the Wi-Fi network you're on, so it can mount shares only on the networks you choose.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>Mountie connects to the file servers on your network to mount your shares.</string>
   <key>SUFeedURL</key><string>https://github.com/marcolaux/mountie-macos/releases/latest/download/appcast.xml</string>
   <key>SUPublicEDKey</key><string>$SPARKLE_PUBKEY</string>
   <key>SUEnableAutomaticChecks</key><true/>
