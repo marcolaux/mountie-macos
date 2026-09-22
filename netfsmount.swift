@@ -17,16 +17,24 @@ guard args.count >= 3, let url = URL(string: args[1]) else { fail("usage: netfsm
 let quiet = args.contains("--quiet")
 
 // Key/value strings from NetFS.h (the CFSTR macros aren't imported into Swift).
-let openOptions = NSMutableDictionary(dictionary: ["UIOption": quiet ? "NoUI" : "AllowUI"])
-// MountAtMountDir: mount exactly at the given directory. MountFlags: MNT_DONTBROWSE (from
-// sys/mount.h) keeps the volume out of Finder's Locations/Desktop — Finder's sidebar shows
-// the share once, as the folder Mountie put there, not again under its server-derived name.
-let mountOptions = NSMutableDictionary(dictionary: ["MountAtMountDir": true,
-                                                     "MountFlags": 0x00100000])
-var mountpoints: Unmanaged<CFArray>?
+func mount(ui: String) -> Int32 {
+    let openOptions = NSMutableDictionary(dictionary: ["UIOption": ui])
+    // MountAtMountDir: mount exactly at the given directory. MountFlags: MNT_DONTBROWSE (from
+    // sys/mount.h) keeps the volume out of Finder's Locations/Desktop — Finder's sidebar shows
+    // the share once, as the folder Mountie put there, not again under its server-derived name.
+    let mountOptions = NSMutableDictionary(dictionary: ["MountAtMountDir": true,
+                                                         "MountFlags": 0x00100000])
+    var mountpoints: Unmanaged<CFArray>?
+    return NetFSMountURLSync(url as CFURL, URL(fileURLWithPath: args[2]) as CFURL, nil, nil,
+                             openOptions as CFMutableDictionary, mountOptions as CFMutableDictionary, &mountpoints)
+}
 
-let rc = NetFSMountURLSync(url as CFURL, URL(fileURLWithPath: args[2]) as CFURL, nil, nil,
-                           openOptions as CFMutableDictionary, mountOptions as CFMutableDictionary, &mountpoints)
+var rc = mount(ui: quiet ? "NoUI" : "AllowUI")
+// AllowUI only asks when macOS has no credentials of its own: a saved Keychain password that
+// no longer works fails straight away, without a dialog. ForceUI always shows the sign-in.
+if !quiet && [EAUTH, EACCES, EPERM].contains(rc) {
+    rc = mount(ui: "ForceUI")
+}
 if rc == 0 {
     print("Mounted")
     exit(0)

@@ -129,7 +129,10 @@ if [[ ${1:-} == release ]]; then
     codesign --force --sign "$ID" --timestamp --options runtime "$NESTED" >/dev/null 2>&1
   done
   codesign --force --sign "$ID" --timestamp --options runtime "$FW" >/dev/null 2>&1
-  codesign --force --sign "$ID" --timestamp --options runtime "$APP" >/dev/null 2>&1
+  # Signing the bundle re-signs the main executable, so its entitlements go here: without
+  # the Location one, hardened runtime silently denies Location (no prompt, ever).
+  codesign --force --sign "$ID" --timestamp --options runtime \
+    --entitlements Mountie.entitlements "$APP" >/dev/null 2>&1
   echo "Signed (Developer ID, hardened runtime)"
 else
   codesign --force --deep --sign - "$APP" >/dev/null 2>&1 && echo "Signed (ad-hoc)"
