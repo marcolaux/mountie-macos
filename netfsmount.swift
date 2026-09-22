@@ -32,7 +32,7 @@ func mount(ui: String) -> Int32 {
 var rc = mount(ui: quiet ? "NoUI" : "AllowUI")
 // AllowUI only asks when macOS has no credentials of its own: a saved Keychain password that
 // no longer works fails straight away, without a dialog. ForceUI always shows the sign-in.
-if !quiet && [EAUTH, EACCES, EPERM].contains(rc) {
+if !quiet && rc == EAUTH {
     rc = mount(ui: "ForceUI")
 }
 if rc == 0 {
@@ -40,11 +40,18 @@ if rc == 0 {
     exit(0)
 }
 
+// Every message carries the code: EAUTH is the only one that means user name or password
+// (NetFS returns it for a 401 as well as for a missing password). EACCES/EPERM come from
+// the server refusing this user, or from macOS refusing the mount itself — a privacy
+// block on the shares folder, say — and are not worth a sign-in dialog.
 switch rc {
-case EAUTH, EACCES, EPERM:
+case EAUTH:
     fail(quiet
          ? "Sign-in required. Mount it once from the app so macOS can save the password to your Keychain."
-         : "Authentication failed.")
+         : "Authentication failed (error \(rc)).")
+case EACCES, EPERM:
+    fail("Access denied (error \(rc): \(String(cString: strerror(rc)))). Either the server refused this user, "
+         + "or macOS didn't allow the mount; check that Mountie may use the shares folder.")
 case EEXIST:
     fail("This share is already mounted somewhere else (for example from Finder). Unmount it there first.")
 case ECANCELED, -128:
@@ -54,7 +61,7 @@ case ENOENT, ENOTDIR:
 case -50:   // paramErr
     fail("The address isn't valid.")
 case let code where code > 0:
-    fail(String(cString: strerror(code)))
+    fail("\(String(cString: strerror(code))) (error \(code)).")
 default:
     fail("NetFS error \(rc)")
 }
