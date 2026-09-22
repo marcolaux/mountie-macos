@@ -42,7 +42,7 @@ if xcrun notarytool history --keychain-profile "$PROFILE" >/dev/null 2>&1; then
   # ticket — otherwise the published download has none and every first launch
   # would depend on Gatekeeper's online check.
   ditto -c -k --keepParent "$APP" "$ZIP"
-  spctl -a -t exec -o install -v "$APP"
+  spctl --assess --type execute --verbose "$APP"
 else
   echo "No notarytool profile '$PROFILE' — publishing without notarization"
 fi

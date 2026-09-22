@@ -1545,7 +1545,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let updater = SPUStandardUpdaterController(startingUpdater: true,
                                                        updaterDelegate: nil, userDriverDelegate: nil)
 
-    @objc func checkForUpdates() { updater.updater.checkForUpdates(nil) }
+    @objc func checkForUpdates() { updater.updater.checkForUpdates() }
     #endif
 }
 
