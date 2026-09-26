@@ -175,32 +175,48 @@ enum Sidebar {
         return fnCreate(nil, type, nil)?.takeRetainedValue()
     }
 
-    /// The list's entry pointing at `url`, or nil. The snapshot is a CFArray of opaque items.
-    /// Paths are compared after resolving symlinks, since that's how Finder stores them
-    /// (it turned /tmp/… into /private/tmp/… when this was learned).
-    private static func find(_ list: LSSharedFileList, _ url: URL) -> LSSharedFileListItem? {
-        guard let fnSnapshot, let fnResolvedURL else { log.warning("snapshot unavailable"); return nil }
+    /// One pass over the list: the entry pointing at `url` (nil if none), plus every dead entry
+    /// — its bookmark no longer resolves — named `name`. Paths are compared after resolving
+    /// symlinks, since that's how Finder stores them (it turned /tmp/… into /private/tmp/…
+    /// when this was learned). The snapshot is a CFArray of opaque items.
+    ///
+    /// Dead entries pile up for WebDAV: a bookmark to a WebDAV mount stops resolving once the
+    /// volume is remounted, so the next add found no entry for the folder and inserted another
+    /// one — the old ones lingered in Finder as duplicates under the share's name.
+    private static func scan(_ list: LSSharedFileList, _ url: URL, _ name: String)
+        -> (live: LSSharedFileListItem?, dead: [LSSharedFileListItem])? {
+        guard let fnSnapshot, let fnResolvedURL, let fnDisplayName else {
+            log.warning("snapshot unavailable"); return nil
+        }
         let target = url.resolvingSymlinksInPath().path
         let rawList = unsafeBitCast(list, to: UnsafeRawPointer.self)
         guard let snapshot = fnSnapshot(rawList, nil)?.takeRetainedValue() else { return nil }
+        var live: LSSharedFileListItem?, dead: [LSSharedFileListItem] = []
         for i in 0..<CFArrayGetCount(snapshot) {
             let item = unsafeBitCast(CFArrayGetValueAtIndex(snapshot, i), to: LSSharedFileListItem.self)
-            if let found = fnResolvedURL(unsafeBitCast(item, to: UnsafeRawPointer.self), resolveFlags, nil)?
-                .takeRetainedValue() as URL?,
-               found.resolvingSymlinksInPath().path == target {
-                return item
+            let rawItem = unsafeBitCast(item, to: UnsafeRawPointer.self)
+            if let found = fnResolvedURL(rawItem, resolveFlags, nil)?.takeRetainedValue() as URL? {
+                if live == nil, found.resolvingSymlinksInPath().path == target { live = item }
+            } else if fnDisplayName(rawItem)?.takeRetainedValue() as String? == name {
+                dead.append(item)
             }
         }
-        return nil
+        return (live, dead)
     }
 
     /// Adds the share's folder to Favorites under the share's name. False if the list already
     /// has an entry for the folder — insert would only *update* it (upsert), and an existing
     /// entry is the user's own favorite: never recorded, so never removed by Mountie.
-    static func add(_ name: String) -> Bool {
+    ///
+    /// `owned`: Mountie added this share's entry before, so dead entries under its name are
+    /// Mountie's leftovers and are cleared first (on every reconcile, which heals duplicates
+    /// that were already there).
+    static func add(_ name: String, owned: Bool) -> Bool {
         guard let list = favorites() else { return false }
         let url = url(for: name)
-        if find(list, url) != nil { return false }
+        guard let (live, dead) = scan(list, url, name) else { return false }
+        if owned { for item in dead { _ = removeItem(list, item, name: name, path: url.path) } }
+        if live != nil { return false }
         // The mounted folder sits on a network volume, and sharedfilelistd refuses to insert an
         // entry pointing at one unless the app holds the Files-and-Folders "Network Volumes"
         // permission. Its check fails silently, so this access triggers macOS's own one-time
@@ -229,27 +245,17 @@ enum Sidebar {
     ///
     /// An entry whose folder is gone — unmount removes it, so a dead entry can linger between
     /// the unmount and this call — no longer resolves through its bookmark, so it's matched by
-    /// the display name instead. A live favorite (one that resolves) is never matched by name.
+    /// the display name instead; all such entries go. A live favorite (one that resolves) is
+    /// never matched by name.
     static func remove(_ name: String) -> Bool {
         guard let list = favorites() else { return false }
         let url = url(for: name)
-        if let item = find(list, url) {
-            return removeItem(list, item, name: name, path: url.path)
+        guard let (live, dead) = scan(list, url, name) else { return false }
+        var ok = true
+        for item in (live.map { [$0] } ?? []) + dead where !removeItem(list, item, name: name, path: url.path) {
+            ok = false
         }
-        guard let fnSnapshot, let fnResolvedURL, let fnDisplayName else {
-            log.warning("snapshot unavailable"); return false
-        }
-        let rawList = unsafeBitCast(list, to: UnsafeRawPointer.self)
-        guard let snapshot = fnSnapshot(rawList, nil)?.takeRetainedValue() else { return false }
-        for i in 0..<CFArrayGetCount(snapshot) {
-            let item = unsafeBitCast(CFArrayGetValueAtIndex(snapshot, i), to: LSSharedFileListItem.self)
-            let rawItem = unsafeBitCast(item, to: UnsafeRawPointer.self)
-            if fnResolvedURL(rawItem, resolveFlags, nil)?.takeRetainedValue() == nil,   // dead bookmark
-               fnDisplayName(rawItem)?.takeRetainedValue() as String? == name {
-                return removeItem(list, item, name: name, path: url.path)
-            }
-        }
-        return true   // nothing points at the share — already gone
+        return ok
     }
 
     private static func removeItem(_ list: LSSharedFileList, _ item: LSSharedFileListItem,
@@ -436,7 +442,7 @@ final class Store: ObservableObject {
     /// never removed). Returns false when the entry already exists.
     @discardableResult
     private func sidebarAdd(_ name: String) -> Bool {
-        guard Sidebar.add(name) else { return false }
+        guard Sidebar.add(name, owned: Prefs.sidebarShares.contains(name)) else { return false }
         Prefs.sidebarShares.insert(name)
         return true
     }
