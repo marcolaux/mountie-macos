@@ -56,11 +56,12 @@ Dev builds you compile yourself have no updater; the menu item isn't there eithe
   edit and remove (right-click works too). Unmount first; editing or removing a mounted share
   is disabled. On a manual mount the folder opens in Finder.
 - **Quit unmounts:** quitting Mountie unmounts everything it mounted (on by default; turn it
-  off in Preferences if shares should stay mounted). A share that won't unmount — files open
+  off in Preferences if shares should stay mounted). If that takes more than a moment, an
+  "Unmounting shares…" dialog with **Cancel** appears. A share that won't unmount — files open
   in another app, a vanished server — brings up a dialog offering **Try Again** (after
-  closing whatever holds it), **Force Unmount**, or **Keep Mounted**; nothing is ever
-  force-unmounted silently. Each unmount attempt is capped at 15 seconds, so a dead server
-  can't hang the quit.
+  closing whatever holds it), **Force Unmount**, **Keep Mounted**, or **Cancel** (stay
+  running); nothing is ever force-unmounted silently. Every unmount attempt, from the menu
+  or on quit, is capped at 20 seconds, so a dead server can't hang the app.
 - Esc closes the window and Preferences, like ⌘W.
 - Shares mount at `<shares folder>/<name>` (default `~/Mountie`, see Preferences) and appear in
   **Finder's sidebar** automatically while mounted, named after the share — and disappear again

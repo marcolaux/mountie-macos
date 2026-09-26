@@ -101,10 +101,14 @@ reachable() { /usr/bin/nc -z -G 3 "$HOST" "$PORT" >/dev/null 2>&1 }
 
 # Runs a command with a seconds cap, so a wedged server can't stall the watcher:
 # an RPC call that never gets answered must not hang the probe schedule.
+# Returns 143 (128+TERM) when the cap fired. The guard runs detached from our stdio:
+# killing the guard subshell leaves its sleep behind, and inside $(...) an orphaned
+# sleep holding the capture pipe would make the caller wait out the whole cap even
+# when the command finished at once.
 timed() {
   local secs=$1; shift
   "$@" & local cmd=$!
-  ( sleep "$secs"; kill "$cmd" 2>/dev/null ) & local guard=$!
+  ( sleep "$secs"; kill "$cmd" 2>/dev/null ) </dev/null >/dev/null 2>&1 & local guard=$!
   wait "$cmd"; local rc=$?
   kill "$guard" 2>/dev/null
   return $rc
@@ -183,7 +187,7 @@ s3_keys_missing() { [[ -z ${RCLONE_CONFIG_MOUNTIE_ACCESS_KEY_ID:-} ]] }
 # Unlike the TCP probe this also validates credentials, which is what auto-mount wants.
 s3_probe() {
   [[ -n $RCLONE && -x $RCLONE ]] || return 1
-  "$RCLONE" lsd "mountie:$BUCKET" --max-depth 1 -1 --contimeout 5s >/dev/null 2>&1
+  "$RCLONE" lsd "mountie:$BUCKET" --max-depth 1 -1 --contimeout 5s --timeout 10s >/dev/null 2>&1
 }
 
 # Starts rclone for this share, waits for it to listen, then NFS-mounts it.
@@ -267,12 +271,30 @@ do_mount() {  # do_mount NAME [quiet]   (quiet: never show a sign-in dialog; use
   print "Mounted $NAME at $MP"
 }
 
+# Seconds each unmount step may take. A server that stopped answering can otherwise hold
+# umount for minutes; the app caps the whole helper a little above two of these.
+UNMOUNT_SECS=${MOUNTIE_UNMOUNT_SECS:-8}
+
 do_unmount() {  # do_unmount NAME [force]  (force is for servers that went away)
   lookup "$1"
   is_mounted || { stop_rclone; print "$NAME is not mounted"; return 0 }
-  local err force=${2:-}
-  err=$(/sbin/umount ${force:+-f} "$MP" 2>&1) || err=$(/usr/sbin/diskutil unmount ${force:+force} "$MP" 2>&1) \
-    || die "Unmount failed (is a file in use?): $err"
+  local err rc force=${2:-}
+  err=$(timed $UNMOUNT_SECS /sbin/umount ${force:+-f} "$MP" 2>&1); rc=$?
+  if (( rc == 143 )); then
+    # A killed umount may still finish in the kernel — only the mount table is the truth.
+    is_mounted && die "Unmount timed out: the server isn't answering. Force the unmount to disconnect anyway."
+  elif (( rc != 0 )); then
+    # Busy for umount is busy for diskutil too — it only takes longer to say so.
+    [[ $err == *"Resource busy"* ]] && is_mounted \
+      && die "$NAME is still in use: a file on it is open in another app. Close it and try again, or force the unmount."
+    err=$(timed $UNMOUNT_SECS /usr/sbin/diskutil unmount ${force:+force} "$MP" 2>&1); rc=$?
+    if (( rc == 143 )); then
+      is_mounted && die "Unmount timed out: the server isn't answering. Force the unmount to disconnect anyway."
+    elif (( rc != 0 )); then
+      is_mounted && die "Unmount failed: ${err:-unknown error}"
+    fi
+  fi
+  is_mounted && die "Unmount failed: $NAME is still mounted"
   rmdir "$MP" 2>/dev/null
   stop_rclone
   print "Unmounted $NAME"

@@ -414,7 +414,10 @@ final class Store: ObservableObject {
     /// Re-reads the config file and the current mount state.
     func reload() async {
         let loaded = Ctl.loadShares()
-        let listing = await Ctl.run(["list"])
+        let listing = await Ctl.run(["list"], timeout: 10)
+        // A listing that failed (or was cut off at the cap) says nothing about the mounts —
+        // treating it as "nothing mounted" would flip every share and tear the sidebar down.
+        guard listing.ok else { return }
         var state: [String: String] = [:]
         for line in listing.out.split(whereSeparator: \.isNewline) {
             let f = line.split(separator: "\t", omittingEmptySubsequences: false)
@@ -466,28 +469,54 @@ final class Store: ObservableObject {
         }
     }
 
+    /// How long one unmount helper may run. Above mountiectl's own two capped steps (8 s
+    /// each) plus its rclone stop, so its specific message ("still in use", "server isn't
+    /// answering") reaches the user rather than the app's generic timeout.
+    nonisolated static let unmountCap: TimeInterval = 20
+
     func toggle(_ share: Share) async {
         busy.insert(share.name)
         defer { busy.remove(share.name) }
+        if share.mounted { await unmount(share); return }
         // S3 goes through rclone, which gets its credentials from the environment.
         let s3 = share.proto == .s3 ? S3Keys.env(for: share.name) : nil
-        if !share.mounted, let problem = await Preflight.problem(for: share) {
+        if let problem = await Preflight.problem(for: share) {
             showError(problem)
             return
         }
-        let r = await Ctl.run([share.mounted ? "unmount" : "mount", share.name], extraEnv: s3)
+        // No cap on a mount: it may sit in a sign-in dialog, and rclone shares the helper's
+        // process group (see Ctl.run).
+        let r = await Ctl.run(["mount", share.name], extraEnv: s3)
         if !r.ok {
             await reload()
             showError(r.err.isEmpty ? "The operation failed." : r.err)
             return
         }
-        if share.mounted {
-            sidebarRemove(share.name)
-        } else {
-            _ = sidebarAdd(share.name)
-            _ = await Ctl.run(["reveal", share.name])
-        }
+        _ = sidebarAdd(share.name)
+        _ = await Ctl.run(["reveal", share.name])
         await reload()
+    }
+
+    /// A manual unmount: capped, and when the share won't go (files open in another app, a
+    /// server that stopped answering) the user decides — try again, force, or leave it.
+    private func unmount(_ share: Share) async {
+        var force = false
+        while true {
+            let args = ["unmount", share.name] + (force ? ["force"] : [])
+            let r = await Ctl.run(args, timeout: Self.unmountCap)
+            await reload()
+            let still = shares.first { $0.name == share.name }?.mounted ?? false
+            if r.ok || !still { sidebarRemove(share.name); return }
+            if force {
+                showError(r.err.isEmpty ? "The share couldn't be unmounted." : r.err)
+                return
+            }
+            switch StuckShares.ask([share.name], detail: r.err, keep: "Cancel", cancel: false) {
+            case .tryAgain: continue
+            case .force: force = true
+            case .keep, .cancel: return
+            }
+        }
     }
 
     func reveal(_ share: Share) async { _ = await Ctl.run(["reveal", share.name]) }
@@ -495,19 +524,25 @@ final class Store: ObservableObject {
     /// One quit-time unmount round: every mounted share in parallel, force only when the user
     /// asked for it in the quit dialog. Returns the names that are still mounted afterwards
     /// (each helper is capped — a vanished server can hang an unmount indefinitely, and a
-    /// capped share counts as stuck).
-    func unmountAll(force: Bool) async -> [String] {
+    /// capped share counts as stuck). Shares already busy (an unmount in flight from the
+    /// menu, or an earlier round the user cancelled) are left to that operation and count
+    /// as stuck for this one.
+    func unmountAll(force: Bool, timeout: TimeInterval = Store.unmountCap) async -> [String] {
         let mounted = shares.filter(\.mounted)
         guard !mounted.isEmpty else { return [] }
         var gone: [String] = [], stuck: [String] = []
+        let todo = mounted.filter { !busy.contains($0.name) }
+        stuck += mounted.filter { busy.contains($0.name) }.map(\.name)
+        for share in todo { busy.insert(share.name) }
         await withTaskGroup(of: (String, Bool).self) { group in
-            for share in mounted {
+            for share in todo {
                 group.addTask {
                     let args = force ? ["unmount", share.name, "force"] : ["unmount", share.name]
-                    return (share.name, await Ctl.run(args, timeout: 15).ok)
+                    return (share.name, await Ctl.run(args, timeout: timeout).ok)
                 }
             }
             for await (name, ok) in group {
+                busy.remove(name)
                 if ok { gone.append(name) } else { stuck.append(name) }
             }
         }
@@ -603,7 +638,7 @@ final class Store: ObservableObject {
 
         var tailscaleRunning = false, tailscaleTailnet: String?
         if targets.contains(where: \.viaTailscale) {
-            let r = await Ctl.run(["tailscale"])
+            let r = await Ctl.run(["tailscale"], timeout: 10)
             tailscaleRunning = r.ok
             tailscaleTailnet = r.ok ? Tailscale.parseTailnet(r.out) : nil
         }
@@ -623,7 +658,7 @@ final class Store: ObservableObject {
             for s in targets {
                 let skip = blocked.contains(s.name)   // conditions not met = unavailable, no need to probe
                 let s3 = s.proto == .s3 ? S3Keys.env(for: s.name) : nil
-                group.addTask { (s.name, skip ? false : await Ctl.run(["probe", s.name], extraEnv: s3).ok) }
+                group.addTask { (s.name, skip ? false : await Ctl.run(["probe", s.name], extraEnv: s3, timeout: 15).ok) }
             }
             var result: [String: Bool] = [:]
             for await (name, ok) in group { result[name] = ok }
@@ -656,7 +691,7 @@ final class Store: ObservableObject {
                 // does so long before the share will mount, and mounting then just
                 // produces I/O errors. "ready" checks that a mount can actually
                 // happen, without mounting anything.
-                guard await Ctl.run(["ready", name], extraEnv: s3).ok else {
+                guard await Ctl.run(["ready", name], extraEnv: s3, timeout: 15).ok else {
                     autoStatus[name] = "Server is up; the share isn't ready yet — retrying…"
                     return
                 }
@@ -695,7 +730,9 @@ final class Store: ObservableObject {
                     st.wantMounted = false
                     if cur.mounted && !busy.contains(name) {
                         busy.insert(name)
-                        let r = await Ctl.run(["unmount", name, "force"])
+                        // Capped: the server is gone, so a umount can hang, and a hung one
+                        // would hold `ticking` and stop the watcher for good.
+                        let r = await Ctl.run(["unmount", name, "force"], timeout: 15)
                         busy.remove(name)
                         if r.ok { sidebarRemove(name) }
                     }
@@ -704,6 +741,44 @@ final class Store: ObservableObject {
             if st.failures >= 2 || !cur.mounted {
                 autoStatus[name] = waiting ?? "Waiting for server…"
             }
+        }
+    }
+}
+
+/// The "couldn't unmount" dialog, shared by the manual unmount and the quit. Modal on purpose:
+/// the operation is on hold until the user decides. `keep` titles the third button ("Cancel"
+/// for a manual unmount, "Keep Mounted" when quitting, where a separate Cancel stays running).
+/// Esc is the last button — leaving things as they are is the least destructive escape.
+enum StuckShares {
+    enum Choice { case tryAgain, force, keep, cancel }
+
+    @MainActor
+    static func ask(_ names: [String], detail: String?, keep: String, cancel: Bool) -> Choice {
+        NSApp.activate()
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = names.count == 1
+            ? "Couldn't unmount “\(names[0])”."
+            : "Couldn't unmount \(names.count) shares."
+        var info = names.count == 1 ? "" : names.joined(separator: ", ") + "\n\n"
+        // The helper's own message says what's wrong ("still in use", "server isn't
+        // answering"); the generic advice is for when there is none (the quit round).
+        if let detail, !detail.isEmpty {
+            info += detail
+        } else {
+            info += "Files on these shares may be open in other apps. Close them and try again, or force the unmount."
+        }
+        alert.informativeText = info
+        alert.addButton(withTitle: "Try Again")
+        alert.addButton(withTitle: "Force Unmount")
+        alert.addButton(withTitle: keep)
+        if cancel { alert.addButton(withTitle: "Cancel") }
+        alert.buttons.last?.keyEquivalent = "\u{1b}"
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: return .tryAgain
+        case .alertSecondButtonReturn: return .force
+        case .alertThirdButtonReturn: return .keep
+        default: return .cancel
         }
     }
 }
@@ -1601,49 +1676,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     /// Quitting unmounts everything Mountie mounted (unless the user turned that off in
-    /// Preferences). The graceful pass runs as helper processes (each capped at 15 s);
-    /// whatever is still mounted then is the user's call, not ours: a dialog offers
-    /// Try Again (after closing the files holding the share), Force Unmount, or Keep
-    /// Mounted — no silent force. Force and Keep always let the quit proceed; whatever
-    /// survives a force stays mounted rather than blocking the quit forever.
+    /// Preferences). The graceful pass runs as capped helper processes; whatever is still
+    /// mounted then is the user's call, not ours: a dialog offers Try Again (after closing
+    /// the files holding the share), Force Unmount, Keep Mounted, or Cancel — no silent
+    /// force. Force and Keep let the quit proceed; whatever survives a force stays mounted
+    /// rather than blocking the quit forever.
+    ///
+    /// `.terminateLater` on purpose: AppKit then runs the loop in the modal-panel mode, in
+    /// which main-actor tasks and alerts still run, and log out / shut down keep waiting for
+    /// us instead of being cancelled (which `.terminateCancel` would do). What the user must
+    /// not get is a frozen app with nothing on screen, so the round shows a cancelable
+    /// "Unmounting…" alert as soon as it takes more than a moment.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard Prefs.unmountOnQuit, Store.shared.shares.contains(where: \.mounted) else {
+        let store = Store.shared
+        guard Prefs.unmountOnQuit, store.shares.contains(where: \.mounted) else {
             return .terminateNow
         }
+        let interactive = !Self.quitIsSystemInitiated
         Task { @MainActor in
-            var stuck = await Store.shared.unmountAll(force: false)
-            while !stuck.isEmpty {
-                switch Self.stuckSharesAlert(stuck) {
-                case .alertFirstButtonReturn:   // Try Again
-                    stuck = await Store.shared.unmountAll(force: false)
-                case .alertSecondButtonReturn:  // Force Unmount — best effort, then quit anyway
-                    _ = await Store.shared.unmountAll(force: true)
-                    stuck = []
-                default:                        // Keep Mounted (also Esc)
-                    stuck = []
-                }
-            }
-            sender.reply(toApplicationShouldTerminate: true)
+            sender.reply(toApplicationShouldTerminate: await Self.quitRound(store, interactive: interactive))
         }
         return .terminateLater
     }
 
-    /// The quit dialog for shares a graceful unmount couldn't remove. Modal on purpose — the
-    /// quit is on hold until the user decides. Esc maps to Keep Mounted: leaving things as
-    /// they are is the least destructive escape.
-    private static func stuckSharesAlert(_ names: [String]) -> NSApplication.ModalResponse {
+    /// Log out, restart and shut down send Quit with a reason; ⌘Q, the Dock and the menu don't.
+    /// The system is waiting on us then, so no dialogs: one bounded best-effort pass.
+    private static var quitIsSystemInitiated: Bool {
+        guard let event = NSAppleEventManager.shared().currentAppleEvent,
+              event.eventClass == AEEventClass(kCoreEventClass),
+              event.eventID == AEEventID(kAEQuitApplication),
+              let why = event.paramDescriptor(forKeyword: AEKeyword(kAEQuitReason)) else { return false }
+        let reasons = [kAELogOut, kAEReallyLogOut, kAEShutDown, kAERestart].map { OSType($0) }
+        return reasons.contains(why.enumCodeValue)
+    }
+
+    /// True to go ahead and quit, false to stay running.
+    private static func quitRound(_ store: Store, interactive: Bool) async -> Bool {
+        guard interactive else {
+            _ = await store.unmountAll(force: false, timeout: 10)
+            return true
+        }
+        var force = false
+        while true {
+            guard let stuck = await unmountWithProgress(store, force: force) else { return false }
+            if stuck.isEmpty || force { return true }   // a force is best effort: quit either way
+            switch StuckShares.ask(stuck, detail: nil, keep: "Keep Mounted", cancel: true) {
+            case .tryAgain: continue
+            case .force: force = true
+            case .keep: return true
+            case .cancel: return false
+            }
+        }
+    }
+
+    /// One unmount round with something on screen: if it hasn't settled within a moment, an
+    /// "Unmounting…" alert with a Cancel button goes up, and the round takes it down when it
+    /// finishes. Returns the names still mounted, or nil when the user cancelled (the capped
+    /// round keeps running to its end in the background; its shares stay busy until then).
+    private static func unmountWithProgress(_ store: Store, force: Bool) async -> [String]? {
+        final class State { var stuck: [String]?; var modalUp = false }   // main actor only
+        let state = State()
+        Task { @MainActor in
+            state.stuck = await store.unmountAll(force: force)
+            // abortModal, not stopModal: this runs from a run loop callback, not a button.
+            if state.modalUp { NSApp.abortModal() }
+        }
+        try? await Task.sleep(for: .milliseconds(800))   // a quick unmount shouldn't flash a dialog
+        if let stuck = state.stuck { return stuck }
+        NSApp.activate()
         let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = names.count == 1
-            ? "Couldn't unmount “\(names[0])”."
-            : "Couldn't unmount \(names.count) shares."
-        alert.informativeText = names.joined(separator: ", ")
-            + "\n\nFiles on these shares may be open in other apps. Close them and try again, "
-            + "force the unmount, or quit and leave them mounted."
-        alert.addButton(withTitle: "Try Again")
-        alert.addButton(withTitle: "Force Unmount")
-        alert.addButton(withTitle: "Keep Mounted")
-        return alert.runModal()
+        alert.messageText = force ? "Force-unmounting shares…" : "Unmounting shares…"
+        alert.informativeText = "This can take a moment when a file is in use or a server isn't answering."
+        let spinner = NSProgressIndicator(frame: NSRect(x: 0, y: 0, width: 32, height: 32))
+        spinner.style = .spinning
+        spinner.startAnimation(nil)
+        alert.accessoryView = spinner
+        alert.addButton(withTitle: "Cancel")
+        state.modalUp = true
+        let response = await runModal(alert)
+        state.modalUp = false
+        return response == .abort ? state.stuck : nil
+    }
+
+    /// Runs the alert from a run-loop block rather than from this task's own main-queue job:
+    /// a modal loop entered from inside a main-queue block doesn't drain the main queue, so
+    /// every main-actor task would stall — including the unmount round that has to end this
+    /// very alert. Modes: the normal loop, and the modal-panel one AppKit uses while a
+    /// `.terminateLater` reply is pending.
+    private static func runModal(_ alert: NSAlert) async -> NSApplication.ModalResponse {
+        await withCheckedContinuation { cont in
+            RunLoop.main.perform(inModes: [.common, .modalPanel]) {
+                cont.resume(returning: alert.runModal())
+            }
+        }
     }
 
     @objc func showPreferences() { WindowManager.shared.showPreferences() }

@@ -330,17 +330,42 @@ enum Ctl {
         return URL(fileURLWithPath: (Bundle.main.resourcePath ?? "") + "/mountiectl")
     }
 
+    /// One continuation with two racing finishers (the reader thread and the timeout timer):
+    /// whoever gets here first resumes it, the other is a no-op.
+    private final class Once<T>: @unchecked Sendable {   // the lock is the guarantee
+        private let lock = NSLock()
+        private var cont: CheckedContinuation<T, Never>?
+        init(_ c: CheckedContinuation<T, Never>) { cont = c }
+        func resume(_ value: T) {
+            lock.lock(); let c = cont; cont = nil; lock.unlock()
+            c?.resume(returning: value)
+        }
+    }
+
+    /// Signals the helper and everything it spawned: Process starts it as the leader of its
+    /// own process group, so the umount/diskutil it runs are in it too. If it somehow isn't a
+    /// leader, signal the pid alone — never a group we could be part of ourselves.
+    private static func signalGroup(_ pid: pid_t, _ sig: Int32) {
+        guard pid > 0 else { return }
+        if getpgid(pid) == pid { _ = killpg(pid, sig) } else { _ = kill(pid, sig) }
+    }
+
     /// Runs the bundled mountiectl script off the main thread. `extraEnv` carries per-call
-    /// variables (the S3 keys for rclone); it never persists anywhere. `timeout` SIGTERMs a
-    /// helper that runs past it and reports failure — for callers that must not hang on a
-    /// vanished server (the quit-time unmount); mounts pass nil since they may be slow.
+    /// variables (the S3 keys for rclone); it never persists anywhere.
+    ///
+    /// `timeout` is a hard cap: at the deadline the call returns ok=false right away — the
+    /// caller must never wait on a helper that may not die (a umount wedged in the kernel on a
+    /// vanished server) — and the helper's whole process group gets SIGTERM, then SIGKILL 2 s
+    /// later if it's still there. Mounts must pass nil: s3_mount's disowned rclone shares the
+    /// group and would die with it, and a mount may legitimately sit in a sign-in dialog.
     static func run(_ args: [String], extraEnv: [String: String]? = nil,
                     timeout: TimeInterval? = nil) async -> Output {
         var env = ProcessInfo.processInfo.environment
         env["MOUNTIE_BASE"] = Prefs.mountBasePath   // the script mounts into <shares folder>/<name>
         for (k, v) in extraEnv ?? [:] { env[k] = v }
         let environment = env
-        return await withCheckedContinuation { cont in
+        return await withCheckedContinuation { (cont: CheckedContinuation<Output, Never>) in
+            let once = Once(cont)
             DispatchQueue.global().async {
                 let p = Process()
                 p.executableURL = helperURL
@@ -350,24 +375,36 @@ enum Ctl {
                 p.standardOutput = o
                 p.standardError = e
                 do { try p.run() } catch {
-                    cont.resume(returning: Output(ok: false, out: "", err: error.localizedDescription))
+                    once.resume(Output(ok: false, out: "", err: error.localizedDescription))
                     return
                 }
-                var timedOut = false
                 var timer: DispatchSourceTimer?
                 if let timeout {
+                    let pid = p.processIdentifier
                     let t = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
                     t.schedule(deadline: .now() + timeout)
-                    t.setEventHandler { timedOut = true; p.terminate() }
+                    t.setEventHandler {
+                        // Report first, clean up second: the caller is free whatever the
+                        // helper does from here on.
+                        once.resume(Output(ok: false, out: "",
+                            err: "Timed out after \(Int(timeout)) s (mountiectl \(args.joined(separator: " ")))"))
+                        signalGroup(pid, SIGTERM)
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                            // Once Foundation has reaped it the pid may be recycled: don't signal then.
+                            if p.isRunning { signalGroup(pid, SIGKILL) }
+                        }
+                    }
                     t.resume()
                     timer = t
                 }
+                // The pipes close when the script dies, even if a child it started outlives it
+                // (its output goes to the script's own capture, not to us).
                 let out = o.fileHandleForReading.readDataToEndOfFile()
                 let err = e.fileHandleForReading.readDataToEndOfFile()
                 p.waitUntilExit()
                 timer?.cancel()
-                cont.resume(returning: Output(
-                    ok: p.terminationStatus == 0 && !timedOut,
+                once.resume(Output(
+                    ok: p.terminationStatus == 0,
                     out: String(decoding: out, as: UTF8.self),
                     err: String(decoding: err, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)))
             }

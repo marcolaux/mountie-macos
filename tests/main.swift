@@ -178,5 +178,34 @@ Prefs.tailscaleAccounts["media"] = nil
 check(Prefs.tailscaleAccounts.isEmpty, "clearing a share's accounts removes them")
 UserDefaults.standard.removeObject(forKey: "autoMountTailscaleAccounts")
 
+print("helper timeout")
+// A stand-in mountiectl that never finishes: the cap must return the caller at the deadline,
+// not when the helper ends, and the helper's own child (the umount/diskutil of a real
+// unmount) must die with it.
+let ctlDir = NSTemporaryDirectory() + "mountie-ctl-\(getpid())"
+try! FileManager.default.createDirectory(atPath: ctlDir, withIntermediateDirectories: true)
+let ctl = ctlDir + "/ctl", childPidFile = ctlDir + "/pid"
+try! """
+#!/bin/zsh
+[[ $1 == quick ]] && { print fine; exit 0 }
+sleep 30 & print $! > "\(childPidFile)"
+wait
+""".write(toFile: ctl, atomically: true, encoding: .utf8)
+chmod(ctl, 0o755)
+setenv("MOUNTIE_CTL", ctl, 1)
+let started = Date()
+let slow = await Ctl.run(["unmount", "x"], timeout: 1)
+let took = Date().timeIntervalSince(started)
+check(!slow.ok && slow.err.contains("imed out"), "a helper past its cap reports a timeout")
+check(took < 3, "…and returns at the cap, not when the helper ends (took \(Int(took)) s)")
+usleep(300_000)
+let childPid = Int32((try? String(contentsOfFile: childPidFile, encoding: .utf8))?
+    .trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
+check(childPid > 0 && kill(childPid, 0) != 0, "the helper's child (sleep) was killed with it")
+let quick = await Ctl.run(["quick"], timeout: 5)
+check(quick.ok && quick.out == "fine\n", "a helper within its cap is unaffected")
+unsetenv("MOUNTIE_CTL")
+try? FileManager.default.removeItem(atPath: ctlDir)
+
 print(failures == 0 ? "\nall passed" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)
