@@ -1,0 +1,52 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(rm -rf *)", "Bash(rm -rf:*)", "Bash(rm -fr *)", "Bash(rm -fr:*)",
+      "Bash(rm -r *)", "Bash(rm -r:*)", "Bash(rm -R *)", "Bash(rm -R:*)",
+      "Bash(sudo rm -rf *)", "Bash(sudo rm -fr *)", "Bash(sudo rm -r *)", "Bash(sudo rm -R *)",
+      "Bash(mountiectl *)", "Bash(mountiectl:*)", "Bash(sudo mountiectl *)",
+      "Bash(netfsmount *)", "Bash(netfsmount:*)", "Bash(sudo netfsmount *)",
+      "Bash(mount_nfs *)", "Bash(mount_nfs:*)", "Bash(sudo mount_nfs *)",
+      "Bash(mount_smbfs *)", "Bash(mount_smbfs:*)", "Bash(sudo mount_smbfs *)",
+      "Bash(mount_ftp *)", "Bash(mount_ftp:*)",
+      "Bash(mount_webdav *)", "Bash(mount_webdav:*)",
+      "Bash(mount -t *)", "Bash(mount -t:*)", "Bash(sudo mount -t *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "statusMessage": "Checking command against the data-safety rules",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard-bash.sh"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "statusMessage": "Loading incident postmortem (docs/incident-2026-10-23.md)",
+            "command": "jq -Rs --arg ev SessionStart '{hookSpecificOutput: {hookEventName: $ev, additionalContext: .}}' \"$CLAUDE_PROJECT_DIR\"/docs/incident-2026-10-23.md"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "statusMessage": "Loading incident postmortem (docs/incident-2026-10-23.md)",
+            "command": "jq -Rs --arg ev SubagentStart '{hookSpecificOutput: {hookEventName: $ev, additionalContext: .}}' \"$CLAUDE_PROJECT_DIR\"/docs/incident-2026-10-23.md"
+          }
+        ]
+      }
+    ]
+  }
+}

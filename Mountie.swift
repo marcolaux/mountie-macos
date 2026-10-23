@@ -1920,6 +1920,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 struct MenuContent: View {
     @ObservedObject var store: Store
+    /// The real delegate, handed down from the adaptor. `NSApp.delegate` is not it: the
+    /// SwiftUI adaptor installs its own private forwarding object there, so a cast to
+    /// AppDelegate is always nil (verified 2026-10-23, macOS 27).
+    let delegate: AppDelegate
 
     var body: some View {
         if store.shares.isEmpty {
@@ -1946,7 +1950,7 @@ struct MenuContent: View {
         Button("Preferences…") { WindowManager.shared.showPreferences() }
             .keyboardShortcut(",")
         #if RELEASE
-        Button("Check for Updates…") { (NSApp.delegate as? AppDelegate)?.checkForUpdates() }
+        Button("Check for Updates…") { delegate.checkForUpdates() }
         #endif
         Divider()
         Button("Quit Mountie") { NSApp.terminate(nil) }
@@ -1961,7 +1965,7 @@ struct MountieApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            MenuContent(store: store)
+            MenuContent(store: store, delegate: delegate)
         } label: {
             // externaldrive is a wide, low shape that looks undersized next to other menu bar
             // icons at the default font, so the symbol is sized up to a typical bar height.

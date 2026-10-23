@@ -52,8 +52,11 @@ else
   echo "No notarytool profile '$PROFILE' — publishing without notarization"
 fi
 
-if [[ -n $(git status --porcelain) ]]; then
-  git add -A
+# Only what the release touches plus already-tracked edits: never `git add -A`, which
+# would sweep in untracked scratch dirs (and whatever a scratch conf names).
+git add VERSION "$NOTES" "$SITE_CONFIG"
+git add -u
+if [[ -n $(git diff --cached --name-only) ]]; then
   git commit -m "Release Mountie $VER
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"

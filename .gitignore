@@ -6,5 +6,10 @@ build.log
 .build/
 website/node_modules/
 website/dist/
-.claude/
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
 .env
+.trash/
+.scan/
+.scratch-*/
