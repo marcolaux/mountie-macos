@@ -4,6 +4,7 @@ import Network
 import CoreWLAN
 import CoreLocation
 import CoreServices
+import DiskArbitration
 import os
 #if RELEASE
 import Sparkle
@@ -364,6 +365,82 @@ enum Preflight {
     }
 }
 
+// MARK: - Mount observer
+
+/// Watches the system for volumes coming and going, so mount state refreshes on events
+/// instead of a poll. Both DiskArbitration and NSWorkspace report, because everything
+/// Mountie mounts is exactly the kind of volume either API has been known to skip:
+/// user-mounted, nobrowse network filesystems, mounted one level under the shares folder.
+/// (Spike-verified 2026-10-23: for NFS via mount_nfs and WebDAV via NetFS — the same two
+/// mechanisms SMB and the S3 localhost-NFS path use — both sources fire within ~5 ms of
+/// mount(2) and unmount(2), with the exact mount path. Verified via Mountie's helper,
+/// `diskutil` (Finder-style) and a cold session seeing already-mounted shares.)
+/// Duplicates are harmless: an event never carries state, it only says the mount table
+/// changed — the handler re-reads the one truth there is (`mountiectl list`).
+@MainActor
+final class MountObserver {
+    /// Shared by Store; app-lifetime, like the Store itself.
+    static let shared = MountObserver()
+
+    /// Called on the main actor with the volume's mount path when the event carries one.
+    /// Unmount events often carry none — the folder is gone by the time anyone asks — so
+    /// the path is optional and the absence is a "maybe", not a "no".
+    var onEvent: ((_ path: String?) -> Void)?
+
+    private var session: DASession?
+    private let queue = DispatchQueue(label: "wtf.laux.mountie.mounts")   // serial: one callback at a time
+    private var workspaceObservers: [NSObjectProtocol] = []
+
+    /// Registers everything, once, at launch. Nothing is ever stopped, like the watcher's
+    /// path monitor in Store.
+    func start() {
+        guard session == nil else { return }
+        if let session = DASessionCreate(nil) {
+            DASessionSetDispatchQueue(session, queue)
+            // A disk appears (and changes description) before it has a mount point — a
+            // pathless such event says nothing yet; the mount point arrives in a later
+            // event. A disappearance that still names its mount point (network volumes
+            // keep it to the end) is the unmount signal; one that doesn't (local volumes)
+            // leaves the moment to NSWorkspace's didUnmount, which carries the path —
+            // so no pathless guess is ever needed, and a USB stick costs nothing.
+            DARegisterDiskAppearedCallback(session, nil, { disk, _ in
+                if let path = mountPath(of: disk) { MountObserver.deliver(path) }
+            }, nil)
+            DARegisterDiskDisappearedCallback(session, nil, { disk, _ in
+                if let path = mountPath(of: disk) { MountObserver.deliver(path) }
+            }, nil)
+            DARegisterDiskDescriptionChangedCallback(session, nil, nil, { disk, _, _ in
+                if let path = mountPath(of: disk) { MountObserver.deliver(path) }
+            }, nil)
+            self.session = session
+        }
+        let center = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
+            workspaceObservers.append(center.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { note in
+                // The volume URL rides in userInfo under the raw Obj-C key — the SDK
+                // exposes no Swift constant for it.
+                let path = (note.userInfo?["NSWorkspaceVolumeURLKey"] as? URL)?.path
+                Task { @MainActor in Self.shared.onEvent?(path) }
+            })
+        }
+    }
+
+    /// The C callbacks (which may run on the DA queue) hop to the main actor; the
+    /// observer is app-lifetime, so unretained is safe here.
+    private static func deliver(_ path: String?) {
+        Task { @MainActor in shared.onEvent?(path) }
+    }
+}
+
+/// Mount point of a disk as DiskArbitration reports it; nil when it has none.
+private func mountPath(of disk: DADisk?) -> String? {
+    guard let disk, let d = DADiskCopyDescription(disk) as? [String: Any],
+          let url = d[kDADiskDescriptionVolumePathKey as String] as? URL else { return nil }
+    return url.path
+}
+
 // MARK: - Store
 
 /// Per-share bookkeeping for the availability watcher.
@@ -390,13 +467,50 @@ final class Store: ObservableObject {
     private var ticking = false
     private let pathMonitor = NWPathMonitor()
 
-    /// Keeps mount state fresh for the menu bar item even when no window is open.
-    func startPolling() {
+    /// Events are the fast path; this is the floor. Whatever a volume event didn't
+    /// cover — an API staying silent about some mount kind, a race at wake — is caught
+    /// within a minute. It's also what picks up shares.conf hand-edits when no share is
+    /// marked auto (the watcher re-reads the config every pass otherwise). Full `reload`:
+    /// config too, so a hand-edit never waits longer than this. Not a preference: a
+    /// correctness floor, not a trade-off anyone wants to tune.
+    nonisolated static let backstopInterval: TimeInterval = 60
+
+    /// A volume came or went. An event carries no state, so a burst — DiskArbitration and
+    /// NSWorkspace both reporting one mount, a remounting rclone — collapses into one
+    /// re-read: the settle lets the duplicates land before the first fork, and anything
+    /// arriving during a refresh re-triggers the loop instead of being dropped.
+    private var pendingEvent = false
+    private var eventTask: Task<Void, Never>?
+    private func noteMountEvent() {
+        pendingEvent = true
+        guard eventTask == nil else { return }
+        eventTask = Task {
+            defer { eventTask = nil }
+            try? await Task.sleep(for: .milliseconds(200))
+            while pendingEvent && !Task.isCancelled {
+                pendingEvent = false
+                await refreshMountState()
+            }
+        }
+    }
+
+    /// Keeps mount state fresh for the menu bar item even when no window is open: volume
+    /// events refresh it within moments, a slow backstop catches anything they miss. The
+    /// first pass is also the launch-time load.
+    func startStateSync() {
+        MountObserver.shared.onEvent = { path in
+            // A USB stick or disk image shouldn't cost a fork; a path we can't map (nil,
+            // or the shares folder spelled differently) falls through — the backstop
+            // bounds a miss.
+            guard MountState.concernsMountie(path, base: Prefs.mountBasePath) else { return }
+            self.noteMountEvent()
+        }
+        MountObserver.shared.start()
         guard pollTask == nil else { return }
         pollTask = Task {
             while !Task.isCancelled {
                 await reload()
-                try? await Task.sleep(for: .seconds(5))
+                try? await Task.sleep(for: .seconds(Self.backstopInterval))
             }
         }
     }
@@ -411,31 +525,41 @@ final class Store: ObservableObject {
         alert.runModal()
     }
 
-    /// Re-reads the config file and the current mount state.
-    func reload() async {
+    /// Re-reads shares.conf and the preferences, keeping the mounted flags as they stand.
+    /// Costs nothing — no helper is run — so it's free to be called often.
+    func refreshConfig() {
+        let flags = Dictionary(shares.map { ($0.name, $0.mounted) }, uniquingKeysWith: { mounted, _ in mounted })
         let loaded = Ctl.loadShares()
-        let listing = await Ctl.run(["list"], timeout: 10)
-        // A listing that failed (or was cut off at the cap) says nothing about the mounts —
-        // treating it as "nothing mounted" would flip every share and tear the sidebar down.
-        guard listing.ok else { return }
-        var state: [String: String] = [:]
-        for line in listing.out.split(whereSeparator: \.isNewline) {
-            let f = line.split(separator: "\t", omittingEmptySubsequences: false)
-            if f.count >= 2 { state[String(f[0])] = String(f[1]) }
-        }
         let auto = Prefs.autoShares, tailscale = Prefs.tailscaleShares,
             wifi = Prefs.wifiNetworks, tsAccounts = Prefs.tailscaleAccounts
-        let updated = loaded.map { s -> Share in
+        let updated = MountState.applying(flags, to: loaded.map { s -> Share in
             var s = s
-            s.mounted = state[s.name] == "mounted"
             s.auto = auto.contains(s.name)
             s.viaTailscale = s.auto && tailscale.contains(s.name)
             s.tailscaleAccounts = s.auto ? (tsAccounts[s.name] ?? []) : []
             s.wifiNetworks = s.auto ? (wifi[s.name] ?? []) : []
             return s
-        }
+        })
+        if updated != shares { shares = updated }
+    }
+
+    /// Re-reads the mount table from the helper and merges it in. One fork; the config and
+    /// preferences are left alone. A listing that failed (or was cut off at the cap) says
+    /// nothing about the mounts — treating it as "nothing mounted" would flip every share
+    /// and tear the sidebar down.
+    func refreshMountState() async {
+        let listing = await Ctl.run(["list"], timeout: 10)
+        guard listing.ok else { return }
+        let updated = MountState.applying(MountState.parse(listing.out), to: shares)
         if updated != shares { shares = updated }
         reconcileSidebar()
+    }
+
+    /// Both of the above: what user actions, the backstop, and a freshly opened window
+    /// call when they need the whole picture at once.
+    func reload() async {
+        refreshConfig()
+        await refreshMountState()
     }
 
     // MARK: Finder sidebar
@@ -613,7 +737,13 @@ final class Store: ObservableObject {
         pathMonitor.start(queue: .global())
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-        ) { _ in Task { @MainActor in await Store.shared.watchTick() } }
+        ) { _ in Task { @MainActor in
+            // Sleep is when mounts die without events, and the ticking guard silently
+            // skips a wake-triggered pass when one is still mid-flight — so ask the
+            // mount table itself before the watcher gets its turn.
+            await Store.shared.refreshMountState()
+            await Store.shared.watchTick()
+        } }
     }
 
     /// One watcher pass. Acts on *changes* in availability rather than on state, so a share
@@ -623,7 +753,8 @@ final class Store: ObservableObject {
         ticking = true
         defer { ticking = false }
 
-        await reload()
+        refreshConfig()   // free: the config decides which shares to watch; the mounted
+                          // flags are as fresh as events and the backstop made them
         let targets = shares.filter(\.auto)
         let names = Set(targets.map(\.name))
         watch = watch.filter { names.contains($0.key) }
@@ -667,7 +798,9 @@ final class Store: ObservableObject {
         for s in targets {
             await apply(s.name, reachable: reachable[s.name] ?? false, waiting: waiting[s.name])
         }
-        await reload()
+        // One fork to end the pass: `apply` reads `mounted` to decide auto-unmounts, so
+        // its decisions start from the mount table, not from whatever events said.
+        await refreshMountState()
     }
 
     private func apply(_ name: String, reachable ok: Bool, waiting: String?) async {
@@ -1659,7 +1792,7 @@ struct PreferencesView: View {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppMenu.install()
-        Store.shared.startPolling()
+        Store.shared.startStateSync()
         Store.shared.startWatching()
         if !UserDefaults.standard.bool(forKey: Prefs.hideWindowOnLaunch) {
             WindowManager.shared.showManage()

@@ -18,3 +18,25 @@ print "mountiectl timed"
   x=$(timed 1 sleep 5 2>&1); rc=$?
   (( rc == 143 )) && print "  ok   reports 143 when the cap fires" \
     || { print "  FAIL cap did not fire (rc=$rc)"; exit 1 }'
+
+# mountiectl's `list`: one mount-table read for the whole listing, tab-separated output
+# the Swift parser depends on, and the same literal " on MP (" match as is_mounted.
+print "mountiectl list"
+/bin/zsh -c '
+  dir=$(mktemp -d)
+  print "one\tnfs://nas1.example/export\nother\tsmb://nas2.example/Documents" > "$dir/conf"
+  cat > "$dir/fakemount" <<EOF
+#!/bin/zsh
+print x >> "$dir/calls"
+print "nas1.example:/export on $dir/base/one (nfs, nobrowse)"
+print "//nas2.example/Documents on /Volumes/elsewhere (smbfs)"
+EOF
+  chmod +x "$dir/fakemount"
+  out=$(MOUNTIE_CONF="$dir/conf" MOUNTIE_BASE="$dir/base" MOUNTIE_MOUNT="$dir/fakemount" ./mountiectl list)
+  [[ $out == $'"'"'one\tmounted\tnfs://nas1.example/export\nother\tunmounted\tsmb://nas2.example/Documents'"'"' ]] \
+    && print "  ok   mounted and unmounted lines come out tab-separated, byte for byte" \
+    || { print "  FAIL wrong listing: $out"; exit 1 }
+  [[ $(wc -l < "$dir/calls") -eq 1 ]] \
+    && print "  ok   the mount table is read once per listing" \
+    || { print "  FAIL mount table read $(wc -l < "$dir/calls") times"; exit 1 }
+  rm -rf "$dir"'

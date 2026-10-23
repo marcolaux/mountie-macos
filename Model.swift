@@ -453,3 +453,48 @@ enum Ctl {
         try? fm.moveItem(at: old, to: confURL)
     }
 }
+
+// MARK: - Mount state
+
+/// Pure mount-state logic: what the helper's `list` output says, how fresh flags merge into
+/// shares, and whether a volume event could concern Mountie. Everything here is the part
+/// of the event-based state sync that has no AppKit dependency, so it runs in the tests.
+enum MountState {
+
+    /// `mountiectl list` output — "name<TAB>mounted|unmounted<TAB>spec" per line — as
+    /// name → mounted. Lines that don't parse (or carry no name) are skipped; the
+    /// caller decides what a missing name means (see `applying`).
+    static func parse(_ listing: String) -> [String: Bool] {
+        var state: [String: Bool] = [:]
+        for line in listing.split(whereSeparator: \.isNewline) {
+            let f = line.split(separator: "\t", omittingEmptySubsequences: false)
+            if f.count >= 2, !f[0].isEmpty { state[String(f[0])] = String(f[1]) == "mounted" }
+        }
+        return state
+    }
+
+    /// Fresh mount flags merged into `shares`: mounted flags update, everything else
+    /// survives untouched. A share the listing didn't mention counts as unmounted —
+    /// `list` reports every configured share, so absence is a verdict, not a gap.
+    static func applying(_ mounted: [String: Bool], to shares: [Share]) -> [Share] {
+        shares.map { s in
+            var s = s
+            s.mounted = mounted[s.name] ?? false
+            return s
+        }
+    }
+
+    /// Whether a volume event could concern Mountie: shares mount exactly one level
+    /// under the shares folder, so only `base/<name>` is ours — a USB stick or disk
+    /// image shouldn't cost a helper run. A nil path (unmount events often have no
+    /// mount point left to report) counts as "maybe": one unnecessary re-read beats
+    /// one missed.
+    static func concernsMountie(_ path: String?, base: String) -> Bool {
+        guard let path, !path.isEmpty else { return true }
+        var base = base
+        while base.count > 1 && base.hasSuffix("/") { base.removeLast() }   // Prefs adds none, users type them
+        guard path.hasPrefix(base + "/") else { return false }
+        let rest = path.dropFirst(base.count + 1)
+        return !rest.isEmpty && !rest.contains("/")
+    }
+}

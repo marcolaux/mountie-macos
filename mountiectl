@@ -23,6 +23,7 @@ STATEDIR="${MOUNTIE_STATE:-$HOME/Library/Application Support/Mountie/state}"
 RCLONE="${MOUNTIE_RCLONE:-${0:A:h}/rclone}"    # S3 helper (bundled; falls back to PATH for dev)
 [[ -x $RCLONE ]] || RCLONE=$(whence -p rclone 2>/dev/null)
 SHOWMOUNT=/usr/bin/showmount; [[ -x $SHOWMOUNT ]] || SHOWMOUNT=/usr/sbin/showmount
+MOUNTBIN="${MOUNTIE_MOUNT:-/sbin/mount}"   # mount-table source (tests point it at a fake)
 DEFAULT_OPTS="soft"
 
 die() { print -u2 -- "$*"; exit 1 }
@@ -94,7 +95,7 @@ lookup() {  # sets NAME SPEC OPTS MP and the parse_spec variables for share $1
 }
 
 # Anything mounted at the share's folder counts, whatever the file system (nfs, smbfs, webdav).
-is_mounted() { /sbin/mount | grep -qF " on $MP ("; }
+is_mounted() { $MOUNTBIN | grep -qF " on $MP ("; }
 
 # Is the share's server reachable on its protocol's port? (needs HOST and PORT)
 reachable() { /usr/bin/nc -z -G 3 "$HOST" "$PORT" >/dev/null 2>&1 }
@@ -300,13 +301,22 @@ do_unmount() {  # do_unmount NAME [force]  (force is for servers that went away)
   print "Unmounted $NAME"
 }
 
+# One mount-table read for the whole listing, matched in memory — is_mounted would fork
+# $MOUNTBIN once per share. Same literal " on MP (" match, quoted so glob characters in
+# a share name can't bite.
+do_list() {
+  local table=$($MOUNTBIN) line
+  shares | while IFS=$'\t' read -r n s o; do
+    local st=unmounted
+    for line in ${(f)table}; do
+      [[ ${line#* on } == "$BASE/$n ("* ]] && { st=mounted; break }
+    done
+    printf '%s\t%s\t%s\n' "$n" "$st" "$s"
+  done
+}
+
 case ${1:-} in
-  list)
-    shares | while IFS=$'\t' read -r n s o; do
-      NAME=$n MP="$BASE/$n"
-      is_mounted && st=mounted || st=unmounted
-      printf '%s\t%s\t%s\n' "$n" "$st" "$s"
-    done ;;
+  list) do_list ;;
   mount)   do_mount "${2:?share name required}" "${3:-}" ;;
   unmount) do_unmount "${2:?share name required}" "${3:-}" ;;
   probe)   lookup "${2:?share name required}"

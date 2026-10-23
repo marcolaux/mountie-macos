@@ -207,5 +207,48 @@ check(quick.ok && quick.out == "fine\n", "a helper within its cap is unaffected"
 unsetenv("MOUNTIE_CTL")
 try? FileManager.default.removeItem(atPath: ctlDir)
 
+print("mount state parsing")
+let listing = """
+media\tmounted\tnfs://nas.example.com/volume1/media
+nas\tunmounted\tsmb://nas.example.com/Documents
+one-field
+\tmounted\tno name
+
+"""
+let flags = MountState.parse(listing)
+check(flags["media"] == true, "a mounted line reads as mounted")
+check(flags["nas"] == false, "an unmounted line reads as unmounted")
+check(flags.count == 2, "blank and unparseable lines are skipped")
+
+print("mount state merging")
+var shares = cases    // the round-trip set above, none mounted
+shares[1].mounted = true
+var merged = MountState.applying(["a": true, "b": false], to: shares)
+check(merged[0].mounted && !merged[1].mounted, "flags update; a share the listing left out is unmounted")
+check(merged[0].proto == shares[0].proto && merged[0].options == shares[0].options &&
+      merged[2].server == shares[2].server && merged[2].username == shares[2].username,
+      "everything except the mounted flag survives untouched")
+check(merged.dropFirst(2).allSatisfy { !$0.mounted }, "absent names are a verdict, not a gap")
+merged = MountState.applying([:], to: shares)
+check(merged.allSatisfy { !$0.mounted }, "an empty listing unmounts everything")
+
+print("mount event filter")
+check(MountState.concernsMountie(nil, base: NSHomeDirectory() + "/Mountie"), "no path (unmount events) counts as maybe")
+check(MountState.concernsMountie("", base: NSHomeDirectory() + "/Mountie"), "an empty path counts as maybe")
+check(MountState.concernsMountie("/Volumes/USB", base: NSHomeDirectory() + "/Mountie") == false,
+      "someone else's volume is not Mountie's")
+check(MountState.concernsMountie(NSHomeDirectory() + "/Mountie", base: NSHomeDirectory() + "/Mountie") == false,
+      "the shares folder itself is not a share")
+check(MountState.concernsMountie(NSHomeDirectory() + "/Mountie/media", base: NSHomeDirectory() + "/Mountie"),
+      "a share's folder is Mountie's")
+check(MountState.concernsMountie(NSHomeDirectory() + "/Mountie/media/sub", base: NSHomeDirectory() + "/Mountie") == false,
+      "deeper folders are not shares")
+check(MountState.concernsMountie(NSHomeDirectory() + "/Mountie/medium", base: NSHomeDirectory() + "/Mountie"),
+      "a sibling folder could still be a share (\"medium\"), so it counts as maybe")
+check(MountState.concernsMountie(NSHomeDirectory() + "/Mountie-ish/one", base: NSHomeDirectory() + "/Mountie") == false,
+      "the shares folder must match as a whole path component, not a prefix")
+check(MountState.concernsMountie(NSHomeDirectory() + "/Mountie/media", base: NSHomeDirectory() + "/Mountie/"),
+      "a trailing slash on the folder changes nothing")
+
 print(failures == 0 ? "\nall passed" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)
