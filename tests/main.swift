@@ -250,5 +250,36 @@ check(MountState.concernsMountie(NSHomeDirectory() + "/Mountie-ish/one", base: N
 check(MountState.concernsMountie(NSHomeDirectory() + "/Mountie/media", base: NSHomeDirectory() + "/Mountie/"),
       "a trailing slash on the folder changes nothing")
 
+print("mount options")
+check(Share(name: "x", server: "nas", path: "/e").effectiveOptions == "soft,intr",
+      "an NFS share with no options is mounted soft and interruptible")
+check(Share(name: "x", server: "nas", path: "/e", options: "vers=4").effectiveOptions == "vers=4,intr",
+      "the user's own options are kept, and get intr")
+check(Share(name: "x", server: "nas", path: "/e", options: "ro,intr").effectiveOptions == "ro,intr",
+      "intr is not added twice")
+check(Share(name: "x", proto: .smb, server: "nas", path: "s").effectiveOptions == "",
+      "options are an NFS thing only")
+
+print("check verdicts")
+check(MountState.parseCheck("mounted\tNAS is mounted and answering") == .mounted, "a mounted verdict")
+check(MountState.parseCheck("unmounted\tNAS is not mounted") == .unmounted, "an unmounted verdict")
+check(MountState.parseCheck("unresponsive\tNAS is mounted, but the server isn't answering") == .unresponsive,
+      "an unresponsive verdict")
+check(MountState.parseCheck("") == nil, "no output says nothing")
+check(MountState.parseCheck("something else") == nil, "garbage says nothing")
+
+print("check verdicts merged")
+var checked = cases
+checked[0].status = .unresponsive
+var verdicts = MountState.applyingChecks(["a": .mounted, "b": .unresponsive], to: checked)
+check(verdicts[0].mounted && verdicts[0].status == .mounted, "a share that answers is mounted")
+check(verdicts[1].mounted && verdicts[1].status == .unresponsive,
+      "a share that doesn't answer is still mounted, and marked unresponsive")
+check(!verdicts[2].mounted && verdicts[2].status == .unmounted, "a share that is gone is unmounted")
+verdicts = MountState.applyingChecks([:], to: checked)
+check(verdicts[0].status == .unresponsive, "a share without a verdict keeps the status it had")
+var listed = MountState.applying(["a": false], to: checked)
+check(listed[0].status == .unmounted, "a share that is gone can't be answering")
+
 print(failures == 0 ? "\nall passed" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

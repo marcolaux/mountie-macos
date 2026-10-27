@@ -171,15 +171,30 @@ enum Sidebar {
         URL(fileURLWithPath: Prefs.mountBasePath).appendingPathComponent(name)
     }
 
+    /// The shares folder with symlinks resolved. The folder itself is a local path, so
+    /// resolving it is safe — unlike the mount point inside it, which sits on the network:
+    /// a stat there on a dead hard mount hangs in the kernel, uninterruptibly.
+    private static func resolvedBase() -> URL {
+        URL(fileURLWithPath: Prefs.mountBasePath).resolvingSymlinksInPath()
+    }
+
+    /// Whether a Favorites entry points at this share's folder. The comparison is made on
+    /// the *parent* — the shares folder — and the name, never on the mount point itself:
+    /// resolving the mount point would stat the network, which hangs on a dead server.
+    /// Symlinks are resolved on the parent, since that's how Finder stores it (it turned
+    /// /tmp/… into /private/tmp/… when this was learned).
+    private static func pointsAt(_ found: URL, base: URL, name: String) -> Bool {
+        guard found.lastPathComponent == name else { return false }
+        return found.deletingLastPathComponent().resolvingSymlinksInPath().path == base.path
+    }
+
     private static func favorites() -> LSSharedFileList? {
         guard let fnCreate, let type = favoritesType else { log.warning("no favorites list"); return nil }
         return fnCreate(nil, type, nil)?.takeRetainedValue()
     }
 
     /// One pass over the list: the entry pointing at `url` (nil if none), plus every dead entry
-    /// — its bookmark no longer resolves — named `name`. Paths are compared after resolving
-    /// symlinks, since that's how Finder stores them (it turned /tmp/… into /private/tmp/…
-    /// when this was learned). The snapshot is a CFArray of opaque items.
+    /// — its bookmark no longer resolves — named `name`. The snapshot is a CFArray of opaque items.
     ///
     /// Dead entries pile up for WebDAV: a bookmark to a WebDAV mount stops resolving once the
     /// volume is remounted, so the next add found no entry for the folder and inserted another
@@ -189,7 +204,7 @@ enum Sidebar {
         guard let fnSnapshot, let fnResolvedURL, let fnDisplayName else {
             log.warning("snapshot unavailable"); return nil
         }
-        let target = url.resolvingSymlinksInPath().path
+        let base = resolvedBase()
         let rawList = unsafeBitCast(list, to: UnsafeRawPointer.self)
         guard let snapshot = fnSnapshot(rawList, nil)?.takeRetainedValue() else { return nil }
         var live: LSSharedFileListItem?, dead: [LSSharedFileListItem] = []
@@ -197,7 +212,7 @@ enum Sidebar {
             let item = unsafeBitCast(CFArrayGetValueAtIndex(snapshot, i), to: LSSharedFileListItem.self)
             let rawItem = unsafeBitCast(item, to: UnsafeRawPointer.self)
             if let found = fnResolvedURL(rawItem, resolveFlags, nil)?.takeRetainedValue() as URL? {
-                if live == nil, found.resolvingSymlinksInPath().path == target { live = item }
+                if live == nil, pointsAt(found, base: base, name: name) { live = item }
             } else if fnDisplayName(rawItem)?.takeRetainedValue() as String? == name {
                 dead.append(item)
             }
@@ -222,6 +237,9 @@ enum Sidebar {
         // entry pointing at one unless the app holds the Files-and-Folders "Network Volumes"
         // permission. Its check fails silently, so this access triggers macOS's own one-time
         // prompt instead ("Mountie would like to access files on a network volume").
+        // It is a read of the network, so it must not run on the main thread: on a dead hard
+        // mount it hangs in the kernel, uninterruptibly, and the app would freeze for good.
+        // The caller runs the whole sidebar work off the main thread for that reason.
         _ = try? FileManager.default.contentsOfDirectory(atPath: url.path)
         guard let fnInsert, let positionLast else { log.warning("LSSharedFileListInsertItemURL unavailable"); return false }
         // The C call only sees raw pointers, so keep the bridged objects alive through it.
@@ -458,6 +476,12 @@ final class Store: ObservableObject {
 
     @Published var shares: [Share] = []
     @Published var busy: Set<String> = []
+    /// When each busy share started. A mount on a server that stopped answering never
+    /// finishes on its own, so the user needs a way out of it — the menu bar offers one
+    /// once it has been working for a while.
+    @Published var busySince: [String: Date] = [:]
+    /// The helper call in flight per share, so a wedged one can be stopped.
+    private var helperCalls: [String: Ctl.Call] = [:]
     /// Human-readable watcher state per share ("Waiting for server…", failures).
     @Published var autoStatus: [String: String] = [:]
 
@@ -525,10 +549,29 @@ final class Store: ObservableObject {
         alert.runModal()
     }
 
+    /// How long a share has been busy, if it is.
+    func busyFor(_ name: String) -> TimeInterval? {
+        guard let since = busySince[name] else { return nil }
+        return Date().timeIntervalSince(since)
+    }
+
+    /// Whether a busy share has been working long enough to be offered a way out: a mount
+    /// on a server that stopped answering never finishes by itself.
+    func busyIsStale(_ name: String, after: TimeInterval = 20) -> Bool {
+        (busyFor(name) ?? 0) > after
+    }
+
+    /// Stops a share's helper — a mount that never finishes, most likely because the
+    /// server isn't answering. The share stays as it is; the user can try again.
+    func cancelBusy(_ name: String) {
+        helperCalls[name]?.cancel()
+    }
+
     /// Re-reads shares.conf and the preferences, keeping the mounted flags as they stand.
     /// Costs nothing — no helper is run — so it's free to be called often.
     func refreshConfig() {
         let flags = Dictionary(shares.map { ($0.name, $0.mounted) }, uniquingKeysWith: { mounted, _ in mounted })
+        let statuses = Dictionary(shares.map { ($0.name, $0.status) }, uniquingKeysWith: { s, _ in s })
         let loaded = Ctl.loadShares()
         let auto = Prefs.autoShares, tailscale = Prefs.tailscaleShares,
             wifi = Prefs.wifiNetworks, tsAccounts = Prefs.tailscaleAccounts
@@ -538,6 +581,7 @@ final class Store: ObservableObject {
             s.viaTailscale = s.auto && tailscale.contains(s.name)
             s.tailscaleAccounts = s.auto ? (tsAccounts[s.name] ?? []) : []
             s.wifiNetworks = s.auto ? (wifi[s.name] ?? []) : []
+            s.status = statuses[s.name] ?? .unmounted
             return s
         })
         if updated != shares { shares = updated }
@@ -552,7 +596,43 @@ final class Store: ObservableObject {
         guard listing.ok else { return }
         let updated = MountState.applying(MountState.parse(listing.out), to: shares)
         if updated != shares { shares = updated }
-        reconcileSidebar()
+        await reconcileSidebar()
+    }
+
+    /// How long one liveness check may take. Above the helper's own caps (a 3 s TCP probe,
+    /// a 5 s filesystem read), so a helper that comes back has really found something.
+    nonisolated static let checkCap: TimeInterval = 20
+
+    /// Asks the helper about every mounted share: is it still there, and does it still
+    /// answer? The mount table alone can't tell "mounted" from "mounted and dead" — a
+    /// share whose server went away stays in the table — and that difference is what
+    /// makes the app freeze: every file operation on a dead hard mount hangs in the
+    /// kernel, uninterruptibly.
+    ///
+    /// The check runs in the helper, never in the app: a helper can be abandoned, an
+    /// in-process read on a dead mount cannot.
+    private func checkMountedShares() async {
+        let mounted = shares.filter(\.mounted)
+        guard !mounted.isEmpty else { return }
+        let verdicts: [String: MountStatus] = await withTaskGroup(of: (String, MountStatus?).self) { group in
+            for s in mounted {
+                let s3 = s.proto == .s3 ? S3Keys.env(for: s.name) : nil
+                group.addTask {
+                    let r = await Ctl.run(["check", s.name], extraEnv: s3, timeout: Self.checkCap)
+                    if let v = MountState.parseCheck(r.out) { return (s.name, v) }
+                    // No verdict: the helper was cut off (which means the share is wedged
+                    // beyond answering) or it failed outright (which says nothing).
+                    return (s.name, r.err.contains("Timed out") ? .unresponsive : nil)
+                }
+            }
+            var out: [String: MountStatus] = [:]
+            for await (name, verdict) in group {
+                if let verdict { out[name] = verdict }
+            }
+            return out
+        }
+        let updated = MountState.applyingChecks(verdicts, to: shares)
+        if updated != shares { shares = updated }
     }
 
     /// Both of the above: what user actions, the backstop, and a freshly opened window
@@ -567,29 +647,37 @@ final class Store: ObservableObject {
     /// Adds the share's folder to Finder's Favorites, remembering only entries Mountie
     /// added itself (a favorite the user dragged there by hand is never recorded, and so
     /// never removed). Returns false when the entry already exists.
+    ///
+    /// Off the main thread, and never for a share that doesn't answer: adding the entry
+    /// reads the mount point, and a read on a dead hard NFS mount hangs in the kernel —
+    /// uninterruptibly, so the app would freeze for good. On a background thread the
+    /// read can only cost a thread, and the entry is retried once the server is back.
     @discardableResult
-    private func sidebarAdd(_ name: String) -> Bool {
-        guard Sidebar.add(name, owned: Prefs.sidebarShares.contains(name)) else { return false }
-        Prefs.sidebarShares.insert(name)
-        return true
+    private func sidebarAdd(_ name: String) async -> Bool {
+        guard shares.first(where: { $0.name == name })?.status != .unresponsive else { return false }
+        let owned = Prefs.sidebarShares.contains(name)
+        let added = await Task.detached(priority: .utility) { Sidebar.add(name, owned: owned) }.value
+        if added { Prefs.sidebarShares.insert(name) }
+        return added
     }
 
     /// Removes the sidebar entry Mountie added for this share, if there is one. The record is
     /// only dropped once the entry is really gone — a failed removal (e.g. the entry's bookmark
     /// died when unmount removed the folder) is retried by the next reconcile pass.
-    private func sidebarRemove(_ name: String) {
+    private func sidebarRemove(_ name: String) async {
         guard Prefs.sidebarShares.contains(name) else { return }
-        if Sidebar.remove(name) { Prefs.sidebarShares.remove(name) }
+        let removed = await Task.detached(priority: .utility) { Sidebar.remove(name) }.value
+        if removed { Prefs.sidebarShares.remove(name) }
     }
 
     /// Keeps Favorites in step with what's actually mounted, healing drift from reboots
     /// (favorites persist, mounts don't), CLI mounts/unmounts, and deleted entries:
     /// everything mounted is in the sidebar, everything else isn't.
-    private func reconcileSidebar() {
-        for s in shares where s.mounted { sidebarAdd(s.name) }
+    private func reconcileSidebar() async {
+        for s in shares where s.mounted { await sidebarAdd(s.name) }
         for name in Prefs.sidebarShares
         where !shares.contains(where: { $0.name == name && $0.mounted }) {
-            sidebarRemove(name)
+            await sidebarRemove(name)
         }
     }
 
@@ -598,10 +686,32 @@ final class Store: ObservableObject {
     /// answering") reaches the user rather than the app's generic timeout.
     nonisolated static let unmountCap: TimeInterval = 20
 
+    /// How long an automatic (quiet) mount may run. A quiet mount has no sign-in dialog
+    /// to wait for, so it can be capped — and it must be: a mount on a server that stopped
+    /// answering never finishes, and it would hold the watcher's `ticking` flag, and with
+    /// it every other share, for good.
+    nonisolated static let mountCap: TimeInterval = 30
+
+    /// Mounts or unmounts a share. The share is busy while it runs — the menu bar entry
+    /// says so — and the busy state always ends, even when the helper doesn't: a mount on
+    /// a server that stopped answering never finishes on its own, so the caller gets a
+    /// handle it can cancel instead of a menu bar that stays disabled for good.
     func toggle(_ share: Share) async {
         busy.insert(share.name)
-        defer { busy.remove(share.name) }
-        if share.mounted { await unmount(share); return }
+        busySince[share.name] = Date()
+        let call = Ctl.Call()
+        helperCalls[share.name] = call
+        defer {
+            busy.remove(share.name)
+            busySince[share.name] = nil
+            helperCalls[share.name] = nil
+        }
+        if share.mounted {
+            // A share that doesn't answer can't be unmounted the polite way: the umount
+            // would sit in the kernel until the server comes back. Force it right away.
+            await unmount(share, force: share.status == .unresponsive)
+            return
+        }
         // S3 goes through rclone, which gets its credentials from the environment.
         let s3 = share.proto == .s3 ? S3Keys.env(for: share.name) : nil
         if let problem = await Preflight.problem(for: share) {
@@ -609,28 +719,30 @@ final class Store: ObservableObject {
             return
         }
         // No cap on a mount: it may sit in a sign-in dialog, and rclone shares the helper's
-        // process group (see Ctl.run).
-        let r = await Ctl.run(["mount", share.name], extraEnv: s3)
+        // process group (see Ctl.run). The user can cancel it from the menu bar instead.
+        let r = await Ctl.run(["mount", share.name], extraEnv: s3, call: call)
         if !r.ok {
             await reload()
-            showError(r.err.isEmpty ? "The operation failed." : r.err)
+            if r.err.isEmpty || r.err == "Cancelled." { return }   // cancelled: the user knows
+            showError(r.err)
             return
         }
-        _ = sidebarAdd(share.name)
+        await sidebarAdd(share.name)
         _ = await Ctl.run(["reveal", share.name])
         await reload()
     }
 
     /// A manual unmount: capped, and when the share won't go (files open in another app, a
     /// server that stopped answering) the user decides — try again, force, or leave it.
-    private func unmount(_ share: Share) async {
-        var force = false
+    /// `force` starts it off: a share that doesn't answer can't be unmounted the polite way.
+    private func unmount(_ share: Share, force forceNow: Bool = false) async {
+        var force = forceNow
         while true {
             let args = ["unmount", share.name] + (force ? ["force"] : [])
             let r = await Ctl.run(args, timeout: Self.unmountCap)
             await reload()
             let still = shares.first { $0.name == share.name }?.mounted ?? false
-            if r.ok || !still { sidebarRemove(share.name); return }
+            if r.ok || !still { await sidebarRemove(share.name); return }
             if force {
                 showError(r.err.isEmpty ? "The share couldn't be unmounted." : r.err)
                 return
@@ -670,7 +782,7 @@ final class Store: ObservableObject {
                 if ok { gone.append(name) } else { stuck.append(name) }
             }
         }
-        for name in gone { sidebarRemove(name) }
+        for name in gone { await sidebarRemove(name) }
         return stuck
     }
 
@@ -755,6 +867,10 @@ final class Store: ObservableObject {
 
         refreshConfig()   // free: the config decides which shares to watch; the mounted
                           // flags are as fresh as events and the backstop made them
+        // A share whose server went away stays in the mount table, so the mount table
+        // can't tell it from a healthy one. This is what notices the difference — every
+        // pass, for every mounted share, auto or not.
+        await checkMountedShares()
         let targets = shares.filter(\.auto)
         let names = Set(targets.map(\.name))
         watch = watch.filter { names.contains($0.key) }
@@ -837,15 +953,17 @@ final class Store: ObservableObject {
                     return
                 }
                 // "quiet": never pop a sign-in dialog for an automatic mount.
-                let r = await Ctl.run(["mount", name, "quiet"], extraEnv: s3)
+                let r = await Ctl.run(["mount", name, "quiet"], extraEnv: s3, timeout: Self.mountCap)
                 busy.remove(name)
                 if r.ok {
                     st.wantMounted = false
                     autoStatus[name] = nil
-                    _ = sidebarAdd(name)
+                    await sidebarAdd(name)
                 } else {
                     st.attempts += 1
-                    autoStatus[name] = "Auto-mount failed: " + (r.err.isEmpty ? "unknown error" : r.err)
+                    autoStatus[name] = r.err.contains("Timed out")
+                        ? "The mount didn't finish — the server isn't answering."
+                        : "Auto-mount failed: " + (r.err.isEmpty ? "unknown error" : r.err)
                     // A mount can still fail on a reachable server (server restarting,
                     // SMB needs a sign-in, the export refuses this client). Never give
                     // up for good — that would strand the share until the server went
@@ -867,7 +985,15 @@ final class Store: ObservableObject {
                         // would hold `ticking` and stop the watcher for good.
                         let r = await Ctl.run(["unmount", name, "force"], timeout: 15)
                         busy.remove(name)
-                        if r.ok { sidebarRemove(name) }
+                        if r.ok {
+                            await sidebarRemove(name)
+                        } else {
+                            // The mount couldn't be cleared: the server is gone and the
+                            // kernel is holding on to it. Say so — the user can force it
+                            // from the menu bar — rather than leaving a dead share that
+                            // looks mounted.
+                            autoStatus[name] = "The server is gone and the mount is stuck — force unmount it."
+                        }
                     }
                 }
             }
@@ -1140,9 +1266,11 @@ struct ShareRow: View {
     var body: some View {
         HStack(spacing: 12) {
             Circle()
-                .fill(share.mounted ? Color.green : Color.secondary.opacity(0.35))
+                .fill(share.status == .unresponsive ? Color.orange
+                      : share.mounted ? Color.green : Color.secondary.opacity(0.35))
                 .frame(width: 10, height: 10)
-                .accessibilityLabel(share.mounted ? "Mounted" : "Not mounted")
+                .accessibilityLabel(share.status == .unresponsive ? "Not responding"
+                                   : share.mounted ? "Mounted" : "Not mounted")
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(share.name).font(.headline)
@@ -1153,6 +1281,10 @@ struct ShareRow: View {
                     .font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
                 if share.proto == .s3 && S3Keys.load(share.name) == nil {
                     Text("S3 keys missing").font(.caption).foregroundStyle(.orange)
+                }
+                if share.status == .unresponsive {
+                    Text("Not responding — the server isn't answering. Anything on this share may hang.")
+                        .font(.caption).foregroundStyle(.orange)
                 }
                 if let status {
                     Text(status).font(.caption).foregroundStyle(.orange)
@@ -1165,7 +1297,7 @@ struct ShareRow: View {
                 Button(action: toggle) {
                     Image(systemName: share.mounted ? "arrow.up.circle" : "arrow.down.circle")
                 }
-                .help(share.mounted ? "Unmount" : "Mount")
+                .help(share.mounted ? (share.status == .unresponsive ? "Force unmount" : "Unmount") : "Mount")
                 .accessibilityLabel(share.mounted ? "Unmount" : "Mount")
                 .disabled(busy)
                 Button(action: reveal) { Image(systemName: "folder") }
@@ -1929,13 +2061,25 @@ struct MenuContent: View {
         if store.shares.isEmpty {
             Text("No shares configured")
         } else {
-            // A checkmark means mounted; click to toggle.
+            // A checkmark means mounted; click to toggle. A share that stopped answering
+            // says so in its own line and stays clickable — the menu bar has to keep
+            // working when a server goes away, that's the whole point.
             ForEach(store.shares) { share in
                 let working = store.busy.contains(share.name)
-                Toggle(working ? "\(share.name) — working…" : share.name,
+                let dead = share.status == .unresponsive
+                Toggle(working ? "\(share.name) — working…"
+                       : dead ? "\(share.name) — not answering" : share.name,
                        isOn: Binding(get: { share.mounted },
                                      set: { _ in Task { await store.toggle(share) } }))
                     .disabled(working)
+                if working, store.busyIsStale(share.name) {
+                    // A mount that never finishes — the server isn't answering — would
+                    // otherwise keep this share busy for good.
+                    Button("Cancel \(share.name)…") { store.cancelBusy(share.name) }
+                }
+                if dead {
+                    Button("Force Unmount \(share.name)…") { Task { await store.toggle(share) } }
+                }
             }
             // Opens a share's mount folder; like Manage Shares' folder button, only once mounted.
             Menu("Show in Finder") {
@@ -1969,7 +2113,11 @@ struct MountieApp: App {
         } label: {
             // externaldrive is a wide, low shape that looks undersized next to other menu bar
             // icons at the default font, so the symbol is sized up to a typical bar height.
-            Image(systemName: store.shares.contains { $0.mounted }
+            // A share that stopped answering gets a warning sign — the icon has to say
+            // "something is wrong" before the menu is even opened.
+            Image(systemName: store.shares.contains { $0.status == .unresponsive }
+                  ? "exclamationmark.triangle.fill"
+                  : store.shares.contains { $0.mounted }
                   ? "externaldrive.badge.checkmark" : "externaldrive.connected.to.line.below")
                 .font(.system(size: 16))
         }

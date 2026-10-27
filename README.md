@@ -77,13 +77,33 @@ Dev builds you compile yourself have no updater; the menu item isn't there eithe
 
 | Protocol | Server / address | Notes |
 |----------|------------------|-------|
-| **NFS**  | `nas.example.com` + path `/volume1/media` | Mount options optional (`ro,soft`, …); default `soft`. |
+| **NFS**  | `nas.example.com` + path `/volume1/media` | Mount options optional (`ro,soft`, …); default `soft`, plus `intr` (see below). |
 | **SMB**  | `nas.example.com` + share `Documents` (or `Documents/Projects`) | Optional username. |
 | **WebDAV** | `dav.example.com` + path `/remote.php/dav` | Optional username; HTTPS on by default. |
 | **S3**   | endpoint `s3.us-east-1.amazonaws.com` (leave empty for Amazon S3) + bucket `photos` or `photos/2026` | Keys via the built-in form; see below. |
 
 Not offered: AFP (the client no longer exists in macOS), and SFTP/FTP (macOS has no usable built-in
 client; SFTP needs third-party software such as macFUSE).
+
+### NFS and a server that goes away
+
+A mount whose server disappears is a *hard* mount by default: every file operation on it waits
+for the server to come back, and it can't be interrupted. That is what used to freeze Mountie
+when a NAS went away — the app waited on a share that was never going to answer.
+
+Two things prevent that now:
+
+- **Every NFS mount gets `intr`**, in addition to whatever options you set (`soft` by default).
+  A call that is delayed on a server that stopped answering then fails with `EINTR` when the
+  process is signalled, so a stuck operation can be cut short instead of waiting for good.
+- **Mountie watches the shares it has mounted.** A share whose server stops answering is marked
+  **"not answering"** — in the window and in the menu bar, where the icon turns into a warning
+  sign — and the menu bar offers **Force Unmount** for it. Nothing is unmounted behind your
+  back. The check runs in the helper process, never in the app, so a dead server can wedge the
+  kernel without wedging Mountie.
+
+The menu bar entry of a share that is working on a mount that never finishes offers **Cancel**,
+so a mount that hangs on a server that stopped answering doesn't keep the share busy for good.
 
 ### S3
 
@@ -194,6 +214,10 @@ probe NAME             exit 0 if the server is reachable
 ready NAME             exit 0 if the share will mount now — checked without
                        mounting anything (NFS: mountd serves the export list;
                        WebDAV: the server answers HTTP)
+check NAME             how the share is doing: "mounted", "unmounted" or
+                       "unresponsive" (mounted, but the server isn't answering);
+                       exit 0 / 1 / 2
+opts NAME              the mount options the share is mounted with
 tailscale              exit 0 if Tailscale is connected; prints the active tailnet
                        on stdout when the CLI can tell
 tailscale-accounts     print the configured profiles as JSON (as the CLI reports them)

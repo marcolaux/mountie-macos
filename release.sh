@@ -18,7 +18,9 @@ ZIP="Mountie-$VER.zip"
 PROFILE="${NOTARY_PROFILE:-mountie-notary}"
 print -r -- "$VER" > VERSION    # build.sh reads this into both plist version keys
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+# Cleanup is a move into the repo's .trash/, not a delete: this project deletes nothing
+# (see CLAUDE.md). The scratch dir holds the appcast until the release is published.
+trap 'mkdir -p .trash; mv "$TMP" .trash/release-$$ 2>/dev/null' EXIT
 
 ./build.sh release
 codesign --verify --strict "$APP"

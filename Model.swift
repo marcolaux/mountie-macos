@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import Security
 
 // MARK: - Model
@@ -17,6 +18,16 @@ enum Proto: String, CaseIterable, Identifiable {
     }
 }
 
+/// What a share's mount is doing. A share whose server went away stays in the mount
+/// table, so the mount table alone can't tell "mounted" from "mounted and dead" — and
+/// that difference is what matters: every file operation on a dead hard mount hangs
+/// in the kernel, uninterruptibly, which is how the app used to freeze.
+enum MountStatus: String, Equatable {
+    case unmounted     // not in the mount table
+    case mounted       // in the mount table, and the server answers
+    case unresponsive  // in the mount table, but the server stopped answering
+}
+
 struct Share: Identifiable, Equatable {
     var name: String
     var proto: Proto = .nfs
@@ -30,9 +41,25 @@ struct Share: Identifiable, Equatable {
     var tailscaleAccounts: [String] = [] // ...restricted to these tailnets (empty = any account)
     var wifiNetworks: [String] = [] // ...or while connected to one of these Wi-Fi networks
     var mounted = false
+    /// Whether the mount still answers. A share whose server went away stays in the
+    /// mount table, so "mounted" and "mounted but dead" look the same there — this
+    /// is what tells them apart.
+    var status: MountStatus = .unmounted
 
     var id: String { name }
-    var displayOptions: String { options.isEmpty ? "soft" : options }
+
+    /// The options the NFS mount actually gets: the helper adds "intr" to every NFS
+    /// mount, so a call delayed on a server that stopped answering fails with EINTR
+    /// when the process is signalled — a stuck operation can be cut short instead of
+    /// hanging until the server answers. The UI shows the same thing the mount
+    /// command uses.
+    var effectiveOptions: String {
+        guard proto == .nfs else { return options }
+        let base = options.isEmpty ? "soft" : options
+        return base.split(separator: ",").contains { $0 == "intr" } ? base : base + ",intr"
+    }
+
+    var displayOptions: String { effectiveOptions }
 
     /// Whether the auto-mount conditions restrict when this share is considered available.
     var hasConditions: Bool { viaTailscale || !wifiNetworks.isEmpty }
@@ -319,6 +346,45 @@ enum Tailscale {
 enum Ctl {
     struct Output { var ok: Bool; var out: String; var err: String }
 
+    /// A helper call in flight. The caller keeps the handle so a helper that never
+    /// finishes — a mount on a server that stopped answering — can be stopped instead
+    /// of blocking whatever asked for it.
+    final class Call: @unchecked Sendable {
+        private let lock = NSLock()
+        private var pid: pid_t = 0
+        private var abandoned = false
+        private var cancelled = false
+
+        func setPid(_ p: pid_t) { lock.lock(); pid = p; lock.unlock() }
+        var processID: pid_t { lock.lock(); defer { lock.unlock() }; return pid }
+        var isAbandoned: Bool { lock.lock(); defer { lock.unlock() }; return abandoned }
+        var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+
+        /// Stop waiting for the helper and signal it. The whole process group goes, so
+        /// whatever it started goes with it. The helper may not die — a call stuck in
+        /// the kernel on a dead server can't be interrupted — but the caller is free
+        /// either way: it stops waiting, and the reader threads stop reading.
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            abandoned = true
+            let p = pid
+            lock.unlock()
+            guard p > 0 else { return }
+            signalGroup(p, SIGTERM)
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                // Once Foundation has reaped it the pid may be recycled: don't signal then.
+                if kill(p, 0) == 0 { signalGroup(p, SIGKILL) }
+            }
+        }
+
+        /// Give up on the helper's output without calling it cancelled (the timeout does
+        /// this): the reader threads stop, the caller stops waiting.
+        func abandon() {
+            lock.lock(); abandoned = true; lock.unlock()
+        }
+    }
+
     static var confURL: URL {
         if let p = ProcessInfo.processInfo.environment["MOUNTIE_CONF"] { return URL(fileURLWithPath: p) }
         return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -345,9 +411,30 @@ enum Ctl {
     /// Signals the helper and everything it spawned: Process starts it as the leader of its
     /// own process group, so the umount/diskutil it runs are in it too. If it somehow isn't a
     /// leader, signal the pid alone — never a group we could be part of ourselves.
-    private static func signalGroup(_ pid: pid_t, _ sig: Int32) {
+    static func signalGroup(_ pid: pid_t, _ sig: Int32) {
         guard pid > 0 else { return }
         if getpgid(pid) == pid { _ = killpg(pid, sig) } else { _ = kill(pid, sig) }
+    }
+
+    /// Reads a pipe to EOF, waking up regularly so an abandoned read can end. A helper that
+    /// never exits (a umount wedged in the kernel on a vanished server) would otherwise
+    /// keep the reader — and the thread it runs on — alive forever.
+    private static func drain(_ handle: FileHandle, abandoned: () -> Bool) -> Data {
+        let fd = handle.fileDescriptor
+        var data = Data()
+        var buf = [UInt8](repeating: 0, count: 16 * 1024)
+        while !abandoned() {
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let ready = poll(&pfd, 1, 200)
+            if ready < 0 { if errno == EINTR { continue }; break }
+            if ready == 0 { continue }             // nothing yet: look at the flag again
+            let n = read(fd, &buf, buf.count)
+            if n > 0 { data.append(contentsOf: buf[0..<n]) }
+            else if n == 0 { break }                // EOF: the helper closed the pipe
+            else if errno != EINTR { break }        // the pipe is gone
+        }
+        try? handle.close()
+        return data
     }
 
     /// Runs the bundled mountiectl script off the main thread. `extraEnv` carries per-call
@@ -358,12 +445,16 @@ enum Ctl {
     /// vanished server) — and the helper's whole process group gets SIGTERM, then SIGKILL 2 s
     /// later if it's still there. Mounts must pass nil: s3_mount's disowned rclone shares the
     /// group and would die with it, and a mount may legitimately sit in a sign-in dialog.
+    ///
+    /// `call` is the handle for this run: the caller can cancel it, which stops the wait
+    /// and signals the helper.
     static func run(_ args: [String], extraEnv: [String: String]? = nil,
-                    timeout: TimeInterval? = nil) async -> Output {
+                    timeout: TimeInterval? = nil, call: Call? = nil) async -> Output {
         var env = ProcessInfo.processInfo.environment
         env["MOUNTIE_BASE"] = Prefs.mountBasePath   // the script mounts into <shares folder>/<name>
         for (k, v) in extraEnv ?? [:] { env[k] = v }
         let environment = env
+        let handle = call ?? Call()
         return await withCheckedContinuation { (cont: CheckedContinuation<Output, Never>) in
             let once = Once(cont)
             DispatchQueue.global().async {
@@ -378,14 +469,16 @@ enum Ctl {
                     once.resume(Output(ok: false, out: "", err: error.localizedDescription))
                     return
                 }
+                let pid = p.processIdentifier
+                handle.setPid(pid)
                 var timer: DispatchSourceTimer?
                 if let timeout {
-                    let pid = p.processIdentifier
                     let t = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
                     t.schedule(deadline: .now() + timeout)
                     t.setEventHandler {
                         // Report first, clean up second: the caller is free whatever the
                         // helper does from here on.
+                        handle.abandon()
                         once.resume(Output(ok: false, out: "",
                             err: "Timed out after \(Int(timeout)) s (mountiectl \(args.joined(separator: " ")))"))
                         signalGroup(pid, SIGTERM)
@@ -397,16 +490,37 @@ enum Ctl {
                     t.resume()
                     timer = t
                 }
-                // The pipes close when the script dies, even if a child it started outlives it
-                // (its output goes to the script's own capture, not to us).
-                let out = o.fileHandleForReading.readDataToEndOfFile()
-                let err = e.fileHandleForReading.readDataToEndOfFile()
-                p.waitUntilExit()
+                // Both pipes are read at once: a helper that fills stderr while we are
+                // still reading stdout would deadlock, and the app would hang with it.
+                var outData = Data(), errData = Data()
+                let group = DispatchGroup()
+                group.enter()
+                DispatchQueue.global().async {
+                    outData = drain(o.fileHandleForReading) { handle.isAbandoned }
+                    group.leave()
+                }
+                group.enter()
+                DispatchQueue.global().async {
+                    errData = drain(e.fileHandleForReading) { handle.isAbandoned }
+                    group.leave()
+                }
+                group.wait()
+                // The helper's exit is waited for, but not forever: after a timeout it can
+                // sit in the kernel for good, and the caller must not wait for that.
+                if handle.isAbandoned {
+                    let deadline = Date().addingTimeInterval(2)
+                    while p.isRunning && Date() < deadline { usleep(50_000) }
+                } else {
+                    p.waitUntilExit()
+                }
                 timer?.cancel()
+                let exited = !p.isRunning
+                let err = handle.isCancelled ? "Cancelled."
+                    : String(decoding: errData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
                 once.resume(Output(
-                    ok: p.terminationStatus == 0,
-                    out: String(decoding: out, as: UTF8.self),
-                    err: String(decoding: err, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)))
+                    ok: exited && p.terminationStatus == 0,
+                    out: String(decoding: outData, as: UTF8.self),
+                    err: err))
             }
         }
     }
@@ -480,6 +594,39 @@ enum MountState {
         shares.map { s in
             var s = s
             s.mounted = mounted[s.name] ?? false
+            if !s.mounted { s.status = .unmounted }   // a share that is gone can't be answering
+            return s
+        }
+    }
+
+    /// The helper's verdict for one share: "mounted", "unmounted" or "unresponsive" on
+    /// stdout, with a detail after a tab. Nil for anything else — a helper that failed
+    /// or was cut off says nothing about the share.
+    static func parseCheck(_ out: String) -> MountStatus? {
+        let line = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = line.split(separator: "\t", omittingEmptySubsequences: false).first else { return nil }
+        switch first.trimmingCharacters(in: .whitespaces) {
+        case "mounted": return .mounted
+        case "unmounted": return .unmounted
+        case "unresponsive": return .unresponsive
+        default: return nil
+        }
+    }
+
+    /// Check verdicts merged into the shares. A share that answers is mounted; one that
+    /// is in the mount table but doesn't answer stays mounted — it *is* mounted, it just
+    /// doesn't answer — and is marked unresponsive; one that isn't in the table at all
+    /// is unmounted. A share without a verdict keeps the status it had: a check that
+    /// didn't finish says nothing about the share.
+    static func applyingChecks(_ verdicts: [String: MountStatus], to shares: [Share]) -> [Share] {
+        shares.map { s in
+            var s = s
+            switch verdicts[s.name] {
+            case .some(.mounted): s.mounted = true; s.status = .mounted
+            case .some(.unmounted): s.mounted = false; s.status = .unmounted
+            case .some(.unresponsive): s.mounted = true; s.status = .unresponsive
+            case .none: break
+            }
             return s
         }
     }

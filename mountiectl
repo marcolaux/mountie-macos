@@ -11,6 +11,9 @@
 # Usage: mountiectl list | mount NAME [quiet] | unmount NAME [force] | toggle NAME | reveal NAME
 #        mountiectl probe NAME   (exit 0 if the server is reachable)
 #        mountiectl ready NAME   (exit 0 if the server will mount now — checks without mounting)
+#        mountiectl check NAME   (how a mounted share is doing: mounted / unmounted /
+#                                 unresponsive — see do_check)
+#        mountiectl opts NAME    (the mount options this share would be mounted with)
 #        mountiectl tailscale    (exit 0 if Tailscale is connected; prints the active
 #                                 tailnet when the CLI can tell)
 #        mountiectl tailscale-accounts   (prints the configured profiles as JSON)
@@ -100,6 +103,39 @@ is_mounted() { $MOUNTBIN | grep -qF " on $MP ("; }
 # Is the share's server reachable on its protocol's port? (needs HOST and PORT)
 reachable() { /usr/bin/nc -z -G 3 "$HOST" "$PORT" >/dev/null 2>&1 }
 
+# Is the server itself answering? A TCP connect is the one probe that can't wedge: it
+# either connects or it times out. It says nothing about credentials — this is a liveness
+# check, not a readiness check ("ready" is that one).
+server_answers() { reachable }
+
+# Does the mounted filesystem still answer? Asking the mount point for its attributes is
+# the honest test — it needs the server, and it's one small request rather than a listing
+# of the whole share. On a hard NFS mount it can wedge in the kernel, uninterruptibly,
+# where even SIGKILL waits for the server: so the read runs in a child we can walk away
+# from. At the cap we kill it and go on without waiting.
+fs_answers() {
+  local rc
+  timed_nowait 5 /usr/bin/stat "$MP" >/dev/null 2>&1
+  rc=$?
+  (( rc == 143 )) && return 1     # the cap fired: it never answered
+  return $rc
+}
+
+# How a mounted share is doing. The mount table only says whether something is mounted:
+# a share whose server went away stays in it, and reads on it hang forever. So the
+# verdict is about the server, too.
+#   exit 0  mounted, and the server answers
+#   exit 1  not mounted
+#   exit 2  mounted, but the server isn't answering
+do_check() {
+  lookup "$1"
+  is_mounted || { print "unmounted\t$NAME is not mounted"; exit 1 }
+  server_answers || { print "unresponsive\t$NAME is mounted, but $HOST isn't answering on port $PORT"; exit 2 }
+  fs_answers || { print "unresponsive\t$NAME is mounted, but the filesystem doesn't answer"; exit 2 }
+  print "mounted\t$NAME is mounted and answering"
+  exit 0
+}
+
 # Runs a command with a seconds cap, so a wedged server can't stall the watcher:
 # an RPC call that never gets answered must not hang the probe schedule.
 # Returns 143 (128+TERM) when the cap fired. The guard runs detached from our stdio:
@@ -113,6 +149,36 @@ timed() {
   wait "$cmd"; local rc=$?
   kill "$guard" 2>/dev/null
   return $rc
+}
+
+# Like timed, but never waits past the cap: the command may sit in uninterruptible
+# sleep (a read on a hard NFS mount whose server is gone), where the kill doesn't take
+# effect until the server answers. The child is left behind — a short read, gone once
+# the server comes back — but the helper moves on instead of hanging with it.
+timed_nowait() {
+  local secs=$1; shift
+  "$@" </dev/null >/dev/null 2>&1 & local cmd=$!
+  local i=0
+  while (( i < secs * 10 )); do
+    kill -0 $cmd 2>/dev/null || { wait $cmd 2>/dev/null; return $? }
+    sleep 0.1
+    (( i++ ))
+  done
+  kill -9 $cmd 2>/dev/null
+  return 143
+}
+
+# The options an NFS mount is mounted with. Every NFS mount gets "intr": a call delayed
+# on a server that stopped answering then fails with EINTR when the process is signalled,
+# so a stuck operation can be cut short. Without it the mount is a "hard" one and every
+# file operation on it hangs uninterruptibly until the server comes back — which is how
+# the app used to freeze when a NAS went away.
+nfs_opts() {
+  local o
+  for o in ${(s:,:)OPTS}; do
+    [[ $o == intr ]] && { print -r -- "$OPTS"; return }
+  done
+  print -r -- "$OPTS,intr"
 }
 
 # Will the share mount right now — checked without mounting anything? Reachable
@@ -261,7 +327,7 @@ do_mount() {  # do_mount NAME [quiet]   (quiet: never show a sign-in dialog; use
   case $PROTO in
     # nobrowse: keep the volume out of Finder's Locations (the app shows the share in the
     # sidebar itself, named after the share — the server-derived volume name would show twice).
-    nfs) err=$(/sbin/mount_nfs -o "$OPTS,nobrowse" "$NFS_SPEC" "$MP" 2>&1) ;;
+    nfs) err=$(/sbin/mount_nfs -o "$(nfs_opts),nobrowse" "$NFS_SPEC" "$MP" 2>&1) ;;
     s3)  s3_mount; return 0 ;;
     *)   [[ -x $NETFS ]] || { rmdir "$MP" 2>/dev/null; die "SMB/WebDAV helper not found at $NETFS" }
          err=$("$NETFS" "$SPEC" "$MP" ${quiet:+--quiet} 2>&1) ;;
@@ -322,6 +388,9 @@ case ${1:-} in
   probe)   lookup "${2:?share name required}"
            case $PROTO in s3) s3_probe ;; *) reachable ;; esac ;;
   ready)   lookup "${2:?share name required}"; ready ;;
+  check)   do_check "${2:?share name required}" ;;
+  opts)    lookup "${2:?share name required}"
+           if [[ $PROTO == nfs ]]; then nfs_opts; else print -r -- "$OPTS"; fi ;;
   tailscale) TS_UP=0 TAILNET=""
              tailscale_state
              [[ -n $TAILNET ]] && print -r -- "$TAILNET"   # active account, when known
@@ -331,5 +400,5 @@ case ${1:-} in
            if is_mounted; then do_unmount "$NAME"; else do_mount "$NAME"; fi ;;
   reveal)  lookup "${2:?share name required}"; /usr/bin/open "$MP" ;;
   config)  [[ -f $CONF ]] || write_sample_conf; print -r -- "$CONF" ;;
-  *) die "Usage: mountiectl list | mount NAME [quiet] | unmount NAME [force] | toggle NAME | reveal NAME | probe NAME | ready NAME | tailscale | tailscale-accounts | config" ;;
+  *) die "Usage: mountiectl list | mount NAME [quiet] | unmount NAME [force] | toggle NAME | reveal NAME | probe NAME | ready NAME | check NAME | opts NAME | tailscale | tailscale-accounts | config" ;;
 esac
